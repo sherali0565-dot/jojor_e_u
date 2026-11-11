@@ -1,8 +1,7 @@
 name: Email Automation
 
-on:
-  # Allow manual runs from GitHub Actions
-  workflow_dispatch:
+# Allow manual runs from GitHub Actions
+workflow_dispatch:
 
 permissions:
   contents: read
@@ -42,6 +41,7 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           MAILBOXES_JSON: ${{ secrets.MAILBOXES_JSON }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          HAMZA_SIGNATURE: ${{ secrets.HAMZA_SIGNATURE }}
 
           # Dry Run is enabled by default for safe testing
           DRY_RUN: ${{ secrets.DRY_RUN || 'true' }}
