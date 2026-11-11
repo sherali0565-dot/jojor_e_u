@@ -11,7 +11,7 @@ from google.oauth2.service_account import Credentials
 from google import genai
 
 # --- Configuration & Constants ---
-COMPANY_NAME = "Vessel Arsal"  # Sender Name update kar diya gaya hai
+COMPANY_NAME = "Western Arsal"  # Company name wapas Western Arsal kar diya hai
 SHEET_NAME = "Outreach_List"  # Apni Google Sheet ka naam yahan likhein
 
 def get_google_sheet():
