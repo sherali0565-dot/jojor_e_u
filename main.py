@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -28,7 +29,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 MAILBOXES_JSON = os.environ["MAILBOXES_JSON"]
 HAMZA_SIGNATURE = os.getenv("HAMZA_SIGNATURE", "").strip()
 
-SEND_INTERVAL_SECONDS = 12 * 60  # Minimum 12 minutes between successful emails
+SEND_INTERVAL_SECONDS = 12 * 60
 DAILY_LIMIT_PER_MAILBOX = 10
 
 SEND_START_HOUR = 8
@@ -520,24 +521,31 @@ def last_successful_send(history_ws):
 
 
 # =========================================================
-# SMTP SENDING
+# SMTP SENDING AND HTML SIGNATURE
 # =========================================================
 
 def get_signature_html():
-    """Read the signature from the HAMZA_SIGNATURE GitHub Secret.
-
-    The secret should contain the raw HTML signature. A JSON string with an
-    "html" property is also accepted, for example: {"html": "<div>...</div>"}.
     """
+    Read the signature from the HAMZA_SIGNATURE GitHub Secret.
+
+    Supports:
+    1. Raw HTML stored directly in the Secret.
+    2. JSON containing an "html" property.
+    """
+
     if not HAMZA_SIGNATURE:
+        logger.warning("HAMZA_SIGNATURE is empty.")
         return ""
 
     try:
         parsed = json.loads(HAMZA_SIGNATURE)
+
         if isinstance(parsed, dict):
             return str(parsed.get("html", ""))
+
         if isinstance(parsed, str):
             return parsed
+
     except json.JSONDecodeError:
         pass
 
@@ -549,23 +557,42 @@ def send_email(mailbox, recipient, subject, body):
     message = EmailMessage()
 
     message["From"] = mailbox["email"]
-    message["To"] = email.utils.formataddr(("Weston Arsal", recipient))
-    message["Subject"] = subject
 
+    # Receiver display name
+    message["To"] = email.utils.formataddr(
+        ("Western Arsal", recipient)
+    )
+
+    message["Subject"] = subject
     message["Message-ID"] = email.utils.make_msgid()
 
+    # Plain text email version
     message.set_content(body)
 
+    # Add HTML signature
     signature_html = get_signature_html()
+
     if signature_html:
-        body_html = html.escape(body).replace("\n", "<br>\n")
+
+        body_html = html.escape(body).replace(
+            "\n",
+            "<br>\n"
+        )
+
         html_content = (
-            "<!doctype html><html><body>"
+            "<!doctype html>"
+            "<html>"
+            "<body>"
             f"<div>{body_html}</div>"
             f"<div>{signature_html}</div>"
-            "</body></html>"
+            "</body>"
+            "</html>"
         )
-        message.add_alternative(html_content, subtype="html")
+
+        message.add_alternative(
+            html_content,
+            subtype="html"
+        )
 
     if DRY_RUN:
         logger.info(
@@ -632,11 +659,6 @@ def process_sends(
     suppression_ws
 ):
 
-    # Time window check bypassed for testing
-    # if not is_send_time():
-    #     logger.info("Outside the sending window.")
-    #     return
-
     templates = get_active_templates(templates_ws)
 
     if not templates:
@@ -648,13 +670,20 @@ def process_sends(
     suppressed = get_suppressed_emails(suppression_ws)
     contacted = get_contacted_emails(history_ws)
 
-    # Send the first email immediately when there is no previous successful
-    # send. Later emails wait at least 12 minutes after the previous success.
+    # First email sends immediately if there is no previous successful send.
+    # Following emails wait at least 12 minutes.
     last_send = last_successful_send(history_ws)
+
     if last_send:
-        elapsed = (now_local() - last_send).total_seconds()
+
+        elapsed = (
+            now_local() - last_send
+        ).total_seconds()
+
         if elapsed < SEND_INTERVAL_SECONDS:
-            logger.info("Waiting for the next sending interval.")
+            logger.info(
+                "Waiting for the next sending interval."
+            )
             return
 
     mailbox = get_next_mailbox(mailboxes, history_ws)
@@ -668,12 +697,16 @@ def process_sends(
 
         remaining = [
             m for m in mailboxes
-            if daily_sent_count(history_ws, m["email"])
-            < DAILY_LIMIT_PER_MAILBOX
+            if daily_sent_count(
+                history_ws,
+                m["email"]
+            ) < DAILY_LIMIT_PER_MAILBOX
         ]
 
         if not remaining:
-            logger.info("All mailboxes reached their daily limits.")
+            logger.info(
+                "All mailboxes reached their daily limits."
+            )
             return
 
         mailbox = remaining[0]
@@ -767,7 +800,9 @@ def process_sends(
                 body
             )
 
-            final_status = "DRY_RUN" if DRY_RUN else "SENT"
+            final_status = (
+                "DRY_RUN" if DRY_RUN else "SENT"
+            )
 
             append_history(
                 history_ws,
@@ -804,8 +839,6 @@ def process_sends(
                 "Email processing completed for %s",
                 recipient
             )
-
-            return
 
         except Exception as exc:
 
@@ -877,7 +910,10 @@ def extract_body(message):
             payload = part.get_payload(decode=True)
 
             if payload:
-                charset = part.get_content_charset() or "utf-8"
+
+                charset = (
+                    part.get_content_charset() or "utf-8"
+                )
 
                 parts.append(
                     payload.decode(
@@ -891,7 +927,10 @@ def extract_body(message):
         payload = message.get_payload(decode=True)
 
         if payload:
-            charset = message.get_content_charset() or "utf-8"
+
+            charset = (
+                message.get_content_charset() or "utf-8"
+            )
 
             parts.append(
                 payload.decode(
@@ -919,10 +958,12 @@ def read_replies(
     for mailbox in mailboxes:
 
         if not mailbox.get("imap_host"):
+
             logger.warning(
                 "IMAP host missing for %s",
                 mailbox["email"]
             )
+
             continue
 
         try:
@@ -970,15 +1011,19 @@ def read_replies(
                 ).strip()
 
                 if message_id and message_id in existing_ids:
+
                     connection.store(
                         number,
                         "+FLAGS",
                         "\\Seen"
                     )
+
                     continue
 
                 from_address = normalize_email(
-                    parseaddr(message.get("From", ""))[1]
+                    parseaddr(
+                        message.get("From", "")
+                    )[1]
                 )
 
                 subject = decode_text(
@@ -992,7 +1037,10 @@ def read_replies(
                     body
                 )
 
-                snippet = body[:300].replace("\n", " ")
+                snippet = body[:300].replace(
+                    "\n",
+                    " "
+                )
 
                 replies_ws.append_row([
                     timestamp(),
@@ -1006,7 +1054,10 @@ def read_replies(
                 if message_id:
                     existing_ids.add(message_id)
 
-                if classification in ("UNSUBSCRIBE", "BOUNCE"):
+                if classification in (
+                    "UNSUBSCRIBE",
+                    "BOUNCE"
+                ):
 
                     add_to_suppression(
                         suppression_ws,
@@ -1041,6 +1092,7 @@ def read_replies(
             connection.logout()
 
         except Exception:
+
             logger.exception(
                 "IMAP reply check failed for %s",
                 mailbox["email"]
@@ -1098,6 +1150,7 @@ def update_dashboard(
     ]
 
     dashboard_ws.clear()
+
     dashboard_ws.update(
         range_name="A1:B9",
         values=dashboard_data
@@ -1118,12 +1171,35 @@ def main():
 
     setup_tabs(spreadsheet)
 
-    websites_ws = get_worksheet(spreadsheet, "Websites")
-    templates_ws = get_worksheet(spreadsheet, "Templates")
-    history_ws = get_worksheet(spreadsheet, "History")
-    replies_ws = get_worksheet(spreadsheet, "Replies")
-    dashboard_ws = get_worksheet(spreadsheet, "Dashboard")
-    suppression_ws = get_worksheet(spreadsheet, "Suppression")
+    websites_ws = get_worksheet(
+        spreadsheet,
+        "Websites"
+    )
+
+    templates_ws = get_worksheet(
+        spreadsheet,
+        "Templates"
+    )
+
+    history_ws = get_worksheet(
+        spreadsheet,
+        "History"
+    )
+
+    replies_ws = get_worksheet(
+        spreadsheet,
+        "Replies"
+    )
+
+    dashboard_ws = get_worksheet(
+        spreadsheet,
+        "Dashboard"
+    )
+
+    suppression_ws = get_worksheet(
+        spreadsheet,
+        "Suppression"
+    )
 
     discover_new_tasks(websites_ws)
 
