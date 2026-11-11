@@ -8,12 +8,12 @@ import imaplib
 import email
 import hashlib
 import logging
+import html
 
 from datetime import datetime, date
 from email.message import EmailMessage
 from email.header import decode_header
 from email.utils import parseaddr
-from zoneinfo import ZoneInfo
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -23,13 +23,12 @@ from google.oauth2.service_account import Credentials
 # CONFIGURATION
 # =========================================================
 
-NY_TZ = ZoneInfo("America/New_York")
-
 GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 MAILBOXES_JSON = os.environ["MAILBOXES_JSON"]
+HAMZA_SIGNATURE = os.getenv("HAMZA_SIGNATURE", "").strip()
 
-SEND_INTERVAL_SECONDS = 600
+SEND_INTERVAL_SECONDS = 12 * 60  # Minimum 12 minutes between successful emails
 DAILY_LIMIT_PER_MAILBOX = 10
 
 SEND_START_HOUR = 8
@@ -243,12 +242,13 @@ def load_mailboxes():
 # GENERAL HELPERS
 # =========================================================
 
-def now_ny():
-    return datetime.now(NY_TZ)
+def now_local():
+    """Return the computer's local date and time."""
+    return datetime.now()
 
 
 def timestamp():
-    return now_ny().strftime("%Y-%m-%d %H:%M:%S")
+    return now_local().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def valid_email(address):
@@ -267,7 +267,7 @@ def normalize_email(address):
 
 
 def is_send_time():
-    current = now_ny()
+    current = now_local()
 
     if current.weekday() >= 5:
         return False
@@ -313,7 +313,7 @@ def append_history(
 ):
     history_ws.append_row([
         timestamp(),
-        now_ny().date().isoformat(),
+        now_local().date().isoformat(),
         recipient,
         website,
         mailbox,
@@ -478,7 +478,7 @@ def get_next_mailbox(mailboxes, history_ws):
 
 
 def daily_sent_count(history_ws, mailbox_email):
-    today = now_ny().date().isoformat()
+    today = now_local().date().isoformat()
     mailbox_email = normalize_email(mailbox_email)
 
     rows = get_rows(history_ws)
@@ -511,7 +511,7 @@ def last_successful_send(history_ws):
             return datetime.strptime(
                 row["Timestamp"],
                 "%Y-%m-%d %H:%M:%S"
-            ).replace(tzinfo=NY_TZ)
+            )
 
         except (KeyError, ValueError):
             continue
@@ -523,17 +523,49 @@ def last_successful_send(history_ws):
 # SMTP SENDING
 # =========================================================
 
+def get_signature_html():
+    """Read the signature from the HAMZA_SIGNATURE GitHub Secret.
+
+    The secret should contain the raw HTML signature. A JSON string with an
+    "html" property is also accepted, for example: {"html": "<div>...</div>"}.
+    """
+    if not HAMZA_SIGNATURE:
+        return ""
+
+    try:
+        parsed = json.loads(HAMZA_SIGNATURE)
+        if isinstance(parsed, dict):
+            return str(parsed.get("html", ""))
+        if isinstance(parsed, str):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    return HAMZA_SIGNATURE
+
+
 def send_email(mailbox, recipient, subject, body):
 
     message = EmailMessage()
 
     message["From"] = mailbox["email"]
-    message["To"] = recipient
+    message["To"] = email.utils.formataddr(("Weston Arsal", recipient))
     message["Subject"] = subject
 
     message["Message-ID"] = email.utils.make_msgid()
 
     message.set_content(body)
+
+    signature_html = get_signature_html()
+    if signature_html:
+        body_html = html.escape(body).replace("\n", "<br>\n")
+        html_content = (
+            "<!doctype html><html><body>"
+            f"<div>{body_html}</div>"
+            f"<div>{signature_html}</div>"
+            "</body></html>"
+        )
+        message.add_alternative(html_content, subtype="html")
 
     if DRY_RUN:
         logger.info(
@@ -616,13 +648,11 @@ def process_sends(
     suppressed = get_suppressed_emails(suppression_ws)
     contacted = get_contacted_emails(history_ws)
 
+    # Send the first email immediately when there is no previous successful
+    # send. Later emails wait at least 12 minutes after the previous success.
     last_send = last_successful_send(history_ws)
-
     if last_send:
-        elapsed = (
-            now_ny() - last_send
-        ).total_seconds()
-
+        elapsed = (now_local() - last_send).total_seconds()
         if elapsed < SEND_INTERVAL_SECONDS:
             logger.info("Waiting for the next sending interval.")
             return
@@ -774,6 +804,8 @@ def process_sends(
                 "Email processing completed for %s",
                 recipient
             )
+
+            return
 
         except Exception as exc:
 
@@ -1036,7 +1068,7 @@ def update_dashboard(
         "DRY_RUN": 0
     }
 
-    today = now_ny().date().isoformat()
+    today = now_local().date().isoformat()
 
     for row in history:
 
@@ -1055,7 +1087,7 @@ def update_dashboard(
 
     dashboard_data = [
         ["Metric", "Value"],
-        ["New York Date", today],
+        ["Local Date", today],
         ["Active Mailboxes", len(mailboxes)],
         ["Daily Limit Per Mailbox", DAILY_LIMIT_PER_MAILBOX],
         ["Today's Sent", counts["SENT"]],
