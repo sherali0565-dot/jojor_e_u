@@ -4,7 +4,7 @@ name: Email Automation
 on:
   schedule:
     # GitHub scheduled runs are approximate; every 5 minutes.
-    - cron: "*/5 * * * *"
+    #- cron: "*/5 * * * *"
 
   workflow_dispatch:
 
