@@ -386,35 +386,76 @@ def append_history(
 # WEBSITE TASKS
 # =========================================================
 
-def discover_new_tasks(websites_ws):
+def discover_new_tasks(websites_ws, run_log_ws=None):
+    """Automatically mark rows PENDING when Website + Email exist and Status is blank.
+
+    Read raw cell values instead of get_all_records so we can diagnose blank,
+    shifted, or unexpected cell values accurately. The expected headers are
+    validated by setup_tabs() before this function runs.
     """
-    Website and Email are the only required manual fields.
-    New rows are automatically marked PENDING.
-    """
+    values = websites_ws.get_all_values()
+    if not values:
+        logger.warning("Websites tab is empty; no header row found.")
+        if run_log_ws:
+            write_run_log(run_log_ws, "WARNING", "DISCOVERY_STOP", "Websites tab is empty")
+        return 0
 
-    rows = get_rows(websites_ws)
+    headers = [str(value).strip() for value in values[0]]
+    header_map = {name: idx for idx, name in enumerate(headers)}
+    required = ["Website", "Email", "Status", "Task ID", "Created At"]
+    missing = [name for name in required if name not in header_map]
+    if missing:
+        message = "Missing Websites columns: " + ", ".join(missing)
+        logger.error(message)
+        if run_log_ws:
+            write_run_log(run_log_ws, "ERROR", "DISCOVERY_HEADER_ERROR", message)
+        return 0
 
-    for index, row in enumerate(rows, start=2):
+    def cell(row, column):
+        idx = header_map[column]
+        return str(row[idx]).strip() if idx < len(row) and row[idx] is not None else ""
 
-        website = str(row.get("Website", "")).strip()
-        recipient = normalize_email(row.get("Email", ""))
-        status = str(row.get("Status", "")).strip()
+    created_count = 0
+    skipped = []
+    for sheet_row, row in enumerate(values[1:], start=2):
+        website = cell(row, "Website")
+        raw_email = cell(row, "Email")
+        recipient = normalize_email(raw_email)
+        status = cell(row, "Status")
 
-        if not website or not recipient or status:
+        # Ignore fully empty spreadsheet rows.
+        if not website and not raw_email and not status:
+            continue
+
+        if not website:
+            skipped.append(f"row {sheet_row}: Website is blank")
+            continue
+        if not recipient:
+            skipped.append(f"row {sheet_row}: Email is blank")
+            continue
+        if not valid_email(recipient):
+            skipped.append(f"row {sheet_row}: Email format is invalid")
+            continue
+        if status:
+            skipped.append(f"row {sheet_row}: Status already contains '{status}'")
             continue
 
         task_id = hashlib.sha256(
-            f"{website}|{recipient}".encode()
+            f"{website}|{recipient}".encode("utf-8")
         ).hexdigest()[:16]
 
         websites_ws.update(
-            range_name=f"C{index}:E{index}",
-            values=[[
-                "PENDING",
-                task_id,
-                timestamp()
-            ]]
+            range_name=f"C{sheet_row}:E{sheet_row}",
+            values=[["PENDING", task_id, timestamp()]]
         )
+        created_count += 1
+        logger.info("Created PENDING task for Websites row %d (%s).", sheet_row, recipient)
+
+    summary = f"Created PENDING={created_count}; " + (" | ".join(skipped[:12]) if skipped else "No skipped populated rows")
+    logger.info("Task discovery: %s", summary)
+    if run_log_ws:
+        write_run_log(run_log_ws, "INFO", "TASK_DISCOVERY", summary)
+    return created_count
 
 
 # =========================================================
@@ -1219,7 +1260,8 @@ def main():
     write_run_log(run_log_ws, "INFO", "MAILBOXES_LOADED", f"Active mailboxes: {len(mailboxes)}")
 
     # Convert new Website + Email rows to PENDING and populate Task ID / Created At.
-    discover_new_tasks(websites_ws)
+    created_tasks = discover_new_tasks(websites_ws, run_log_ws)
+    write_run_log(run_log_ws, "INFO", "TASKS_CREATED", f"Automatically marked PENDING: {created_tasks}")
     total_rows = len(get_rows(websites_ws))
     pending_before = pending_task_count(websites_ws)
     logger.info("Websites tab: %d data row(s); %d PENDING task(s).", total_rows, pending_before)
