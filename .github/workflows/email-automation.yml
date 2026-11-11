@@ -3,7 +3,7 @@ name: Email Automation
 
 on:
   schedule:
-    # Run every 5 minutes (UTC)
+    # GitHub scheduled runs are approximate; every 5 minutes.
     - cron: "*/5 * * * *"
 
   workflow_dispatch:
@@ -42,7 +42,8 @@ jobs:
           MAILBOXES_JSON: ${{ secrets.MAILBOXES_JSON }}
           HAMZA_SIGNATURE: ${{ secrets.HAMZA_SIGNATURE }}
 
-          DRY_RUN: ${{ secrets.DRY_RUN || 'true' }}
+          # Real sending enabled by default. Set DRY_RUN=true only for testing.
+          DRY_RUN: ${{ secrets.DRY_RUN || 'false' }}
           PYTHONUNBUFFERED: "1"
 
         run: python main.py
