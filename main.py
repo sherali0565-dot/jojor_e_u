@@ -2,7 +2,6 @@
 import os
 import re
 import json
-import time
 import ssl
 import smtplib
 import imaplib
@@ -11,10 +10,10 @@ import hashlib
 import logging
 import html
 
-from datetime import datetime, date
+from datetime import datetime
 from email.message import EmailMessage
 from email.header import decode_header
-from email.utils import parseaddr
+from email.utils import formataddr, make_msgid, parseaddr
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -29,7 +28,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 MAILBOXES_JSON = os.environ["MAILBOXES_JSON"]
 HAMZA_SIGNATURE = os.getenv("HAMZA_SIGNATURE", "").strip()
 
-SEND_INTERVAL_SECONDS = 12 * 60  # Minimum 12 minutes between successful emails
+SEND_INTERVAL_SECONDS = 12 * 60
 DAILY_LIMIT_PER_MAILBOX = 10
 
 SEND_START_HOUR = 8
@@ -56,6 +55,53 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets"
 ]
 
+HEADERS = {
+    "Websites": [
+        "Website",
+        "Email",
+        "Status",
+        "Task ID",
+        "Created At",
+        "Last Sent At",
+        "Mailbox",
+        "Reply Status",
+        "Notes"
+    ],
+    "Templates": [
+        "Template ID",
+        "Subject",
+        "Body",
+        "Active"
+    ],
+    "History": [
+        "Timestamp",
+        "Date",
+        "Email",
+        "Website",
+        "Mailbox",
+        "Status",
+        "Message ID",
+        "Details"
+    ],
+    "Replies": [
+        "Received At",
+        "From",
+        "Subject",
+        "Message ID",
+        "Classification",
+        "Snippet"
+    ],
+    "Dashboard": [
+        "Metric",
+        "Value"
+    ],
+    "Suppression": [
+        "Email",
+        "Reason",
+        "Added At"
+    ]
+}
+
 
 def connect_google_sheets():
     service_info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
@@ -70,65 +116,7 @@ def connect_google_sheets():
     return client.open_by_key(GOOGLE_SHEET_ID)
 
 
-HEADERS = {
-    "Websites": [
-        "Website",
-        "Email",
-        "Status",
-        "Task ID",
-        "Created At",
-        "Last Sent At",
-        "Mailbox",
-        "Reply Status",
-        "Notes"
-    ],
-
-    "Templates": [
-        "Template ID",
-        "Subject",
-        "Body",
-        "Active"
-    ],
-
-    "History": [
-        "Timestamp",
-        "Date",
-        "Email",
-        "Website",
-        "Mailbox",
-        "Status",
-        "Message ID",
-        "Details"
-    ],
-
-    "Replies": [
-        "Received At",
-        "From",
-        "Subject",
-        "Message ID",
-        "Classification",
-        "Snippet"
-    ],
-
-    "Dashboard": [
-        "Metric",
-        "Value"
-    ],
-
-    "Suppression": [
-        "Email",
-        "Reason",
-        "Added At"
-    ]
-}
-
-
 def setup_tabs(spreadsheet):
-    """
-    Create missing tabs and headers.
-    Existing user data is not intentionally erased.
-    """
-
     existing_sheets = {
         ws.title: ws
         for ws in spreadsheet.worksheets()
@@ -147,7 +135,6 @@ def setup_tabs(spreadsheet):
             continue
 
         worksheet = existing_sheets[tab_name]
-
         current_headers = worksheet.row_values(1)
 
         if not current_headers:
@@ -169,23 +156,6 @@ def get_worksheet(spreadsheet, name):
 # =========================================================
 
 def load_mailboxes():
-    """
-    Expected MAILBOXES_JSON format:
-
-    [
-      {
-        "name": "Mailbox 1",
-        "email": "sender@example.com",
-        "password": "APP_PASSWORD",
-        "smtp_host": "mail.example.com",
-        "smtp_port": 587,
-        "imap_host": "mail.example.com",
-        "imap_port": 993,
-        "active": true
-      }
-    ]
-    """
-
     raw_mailboxes = json.loads(MAILBOXES_JSON)
 
     if not isinstance(raw_mailboxes, list):
@@ -244,7 +214,6 @@ def load_mailboxes():
 # =========================================================
 
 def now_local():
-    """Return the computer's local date and time."""
     return datetime.now()
 
 
@@ -265,6 +234,103 @@ def valid_email(address):
 
 def normalize_email(address):
     return (address or "").strip().lower()
+
+
+def clean_website_name(website):
+    """
+    Convert a website URL/domain into a readable business name.
+
+    Examples:
+    James-Williams.com       -> James Williams
+    www.Hamza-Khan.com       -> Hamza Khan
+    Tree-Huggers.com         -> Tree Huggers
+    TreeHuggers.com          -> Tree Huggers
+    https://example.com/page -> Example
+    """
+
+    if not website:
+        return ""
+
+    name = str(website).strip()
+
+    # Remove URL scheme
+    name = re.sub(
+        r"^https?://",
+        "",
+        name,
+        flags=re.IGNORECASE
+    )
+
+    # Remove www
+    name = re.sub(
+        r"^www\.",
+        "",
+        name,
+        flags=re.IGNORECASE
+    )
+
+    # Remove path, query string and fragment
+    name = re.split(r"[/\?#]", name, maxsplit=1)[0]
+
+    # Remove common domain extensions
+    suffixes = (
+        ".co.uk",
+        ".org.uk",
+        ".com.au",
+        ".net.au",
+        ".co.nz",
+        ".com.pk",
+        ".co.in",
+        ".com",
+        ".net",
+        ".org",
+        ".io",
+        ".biz",
+        ".info",
+        ".edu",
+        ".gov",
+        ".pk",
+        ".uk",
+        ".us",
+        ".ca",
+        ".au",
+        ".de",
+        ".fr",
+        ".in"
+    )
+
+    lower_name = name.lower()
+
+    for suffix in suffixes:
+        if lower_name.endswith(suffix):
+            name = name[:-len(suffix)]
+            break
+
+    # If a subdomain remains, use the main domain name
+    if "." in name:
+        name = name.split(".")[-1]
+
+    # Split separators into spaces
+    name = re.sub(r"[-_.]+", " ", name)
+
+    # Split CamelCase: TreeHuggers -> Tree Huggers
+    name = re.sub(
+        r"([a-z])([A-Z])",
+        r"\1 \2",
+        name
+    )
+
+    # Split acronym followed by a normal word
+    name = re.sub(
+        r"([A-Z])([A-Z][a-z])",
+        r"\1 \2",
+        name
+    )
+
+    # Remove extra spaces
+    name = re.sub(r"\s+", " ", name).strip()
+
+    return name.title()
 
 
 def is_send_time():
@@ -289,9 +355,13 @@ def decode_text(value):
     decoded_parts = []
 
     for part, encoding in decode_header(value):
+
         if isinstance(part, bytes):
             decoded_parts.append(
-                part.decode(encoding or "utf-8", errors="replace")
+                part.decode(
+                    encoding or "utf-8",
+                    errors="replace"
+                )
             )
         else:
             decoded_parts.append(part)
@@ -329,11 +399,6 @@ def append_history(
 # =========================================================
 
 def discover_new_tasks(websites_ws):
-    """
-    Website and Email are the only required manual fields.
-    New rows are automatically marked PENDING.
-    """
-
     rows = get_rows(websites_ws)
 
     for index, row in enumerate(rows, start=2):
@@ -456,6 +521,7 @@ def get_next_mailbox(mailboxes, history_ws):
     last_mailbox = None
 
     for row in reversed(rows):
+
         if str(row.get("Status", "")).upper() == "SENT":
             last_mailbox = normalize_email(
                 row.get("Mailbox", "")
@@ -521,54 +587,77 @@ def last_successful_send(history_ws):
 
 
 # =========================================================
-# SMTP SENDING
+# EMAIL SIGNATURE
 # =========================================================
 
 def get_signature_html():
-    """Read the signature from the HAMZA_SIGNATURE GitHub Secret.
-
-    The secret should contain the raw HTML signature. A JSON string with an
-    "html" property is also accepted, for example: {"html": "<div>...</div>"}.
     """
+    Read HTML signature from HAMZA_SIGNATURE GitHub Secret.
+
+    Raw HTML is accepted.
+    JSON with an "html" property is also accepted.
+    """
+
     if not HAMZA_SIGNATURE:
         return ""
 
     try:
         parsed = json.loads(HAMZA_SIGNATURE)
+
         if isinstance(parsed, dict):
             return str(parsed.get("html", ""))
+
         if isinstance(parsed, str):
             return parsed
+
     except json.JSONDecodeError:
         pass
 
     return HAMZA_SIGNATURE
 
 
+# =========================================================
+# SMTP SENDING
+# =========================================================
+
 def send_email(mailbox, recipient, subject, body):
 
     message = EmailMessage()
 
-    message["From"] = mailbox["email"]
-    message["To"] = email.utils.formataddr(("Western Arsal", recipient))
-    message["Subject"] = subject
+    # Sender display name shown in the recipient's inbox
+    message["From"] = formataddr(
+        ("Western Arsal", mailbox["email"])
+    )
 
-    message["Message-ID"] = email.utils.make_msgid()
+    message["To"] = recipient
+    message["Subject"] = subject
+    message["Message-ID"] = make_msgid()
 
     message.set_content(body)
 
     signature_html = get_signature_html()
+
     if signature_html:
-        body_html = html.escape(body).replace("\n", "<br>\n")
+
+        body_html = html.escape(body).replace(
+            "\n",
+            "<br>\n"
+        )
+
         html_content = (
             "<!doctype html><html><body>"
             f"<div>{body_html}</div>"
             f"<div>{signature_html}</div>"
             "</body></html>"
         )
-        message.add_alternative(html_content, subtype="html")
+
+        message.add_alternative(
+            html_content,
+            subtype="html"
+        )
 
     if DRY_RUN:
+
         logger.info(
             "DRY RUN: Would send to %s using %s",
             recipient,
@@ -633,11 +722,6 @@ def process_sends(
     suppression_ws
 ):
 
-    # Time window check bypassed for testing
-    # if not is_send_time():
-    #     logger.info("Outside the sending window.")
-    #     return
-
     templates = get_active_templates(templates_ws)
 
     if not templates:
@@ -649,11 +733,16 @@ def process_sends(
     suppressed = get_suppressed_emails(suppression_ws)
     contacted = get_contacted_emails(history_ws)
 
-    # Send the first email immediately when there is no previous successful
-    # send. Later emails wait at least 12 minutes after the previous success.
+    # First email can send immediately.
+    # Later emails wait at least 12 minutes after the previous successful send.
     last_send = last_successful_send(history_ws)
+
     if last_send:
-        elapsed = (now_local() - last_send).total_seconds()
+
+        elapsed = (
+            now_local() - last_send
+        ).total_seconds()
+
         if elapsed < SEND_INTERVAL_SECONDS:
             logger.info("Waiting for the next sending interval.")
             return
@@ -669,8 +758,10 @@ def process_sends(
 
         remaining = [
             m for m in mailboxes
-            if daily_sent_count(history_ws, m["email"])
-            < DAILY_LIMIT_PER_MAILBOX
+            if daily_sent_count(
+                history_ws,
+                m["email"]
+            ) < DAILY_LIMIT_PER_MAILBOX
         ]
 
         if not remaining:
@@ -722,18 +813,19 @@ def process_sends(
 
         template = select_template(templates, index)
 
+        # Convert domain into a professional display name
+        website_name = clean_website_name(website)
+
         subject = template["subject"].replace(
             "{website_name}",
-            website
+            website_name
         )
 
         body = template["body"].replace(
             "{website_name}",
-            website
+            website_name
         )
 
-        # Record SENDING before contacting SMTP.
-        # If a run crashes here, manual review is required.
         append_history(
             history_ws,
             recipient,
@@ -827,8 +919,6 @@ def process_sends(
                 ]]
             )
 
-        # Only one recipient per workflow run.
-        # The next scheduled run handles the next recipient.
         return
 
 
@@ -878,6 +968,7 @@ def extract_body(message):
             payload = part.get_payload(decode=True)
 
             if payload:
+
                 charset = part.get_content_charset() or "utf-8"
 
                 parts.append(
@@ -892,6 +983,7 @@ def extract_body(message):
         payload = message.get_payload(decode=True)
 
         if payload:
+
             charset = message.get_content_charset() or "utf-8"
 
             parts.append(
@@ -971,15 +1063,19 @@ def read_replies(
                 ).strip()
 
                 if message_id and message_id in existing_ids:
+
                     connection.store(
                         number,
                         "+FLAGS",
                         "\\Seen"
                     )
+
                     continue
 
                 from_address = normalize_email(
-                    parseaddr(message.get("From", ""))[1]
+                    parseaddr(
+                        message.get("From", "")
+                    )[1]
                 )
 
                 subject = decode_text(
@@ -993,7 +1089,10 @@ def read_replies(
                     body
                 )
 
-                snippet = body[:300].replace("\n", " ")
+                snippet = body[:300].replace(
+                    "\n",
+                    " "
+                )
 
                 replies_ws.append_row([
                     timestamp(),
@@ -1015,7 +1114,6 @@ def read_replies(
                         classification
                     )
 
-                # Update matching website reply status.
                 website_rows = get_rows(websites_ws)
 
                 for index, website_row in enumerate(
@@ -1042,6 +1140,7 @@ def read_replies(
             connection.logout()
 
         except Exception:
+
             logger.exception(
                 "IMAP reply check failed for %s",
                 mailbox["email"]
@@ -1099,6 +1198,7 @@ def update_dashboard(
     ]
 
     dashboard_ws.clear()
+
     dashboard_ws.update(
         range_name="A1:B9",
         values=dashboard_data
