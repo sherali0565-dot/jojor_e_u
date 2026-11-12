@@ -392,13 +392,50 @@ def gemini_website_name(website):
         if (not name or len(name) > 80 or
                 not re.fullmatch(r"[A-Za-z0-9]+(?:[ '-][A-Za-z0-9]+)*", name)):
             raise ValueError("Gemini returned an invalid website name")
+
+        # Normalize capitalization even if Gemini returns lower/title-mixed text.
+        name = " ".join(
+            word[0].upper() + word[1:].lower() if word else word
+            for word in name.split()
+        )
+
+        # Known joined-name spelling: preserve the correct human name even when
+        # the source domain is entirely lowercase and has no word boundary.
+        domain = str(website).strip()
+        domain = re.sub(r"^https?://", "", domain, flags=re.IGNORECASE)
+        domain = re.sub(r"^www\\.", "", domain, flags=re.IGNORECASE)
+        domain = re.split(r"[/\\?#]", domain, maxsplit=1)[0]
+        domain = re.sub(
+            r"\\.(co\\.uk|org\\.uk|com\\.au|net\\.au|co\\.nz|com\\.pk|co\\.in|com|net|org|io|biz|info|edu|gov|pk|uk|us|ca|au|de|fr|in)$",
+            "",
+            domain,
+            flags=re.IGNORECASE,
+        )
+        domain_key = re.sub(r"[^a-z]", "", domain.lower())
+        known_names = {
+            "hamzakhan": "Hamza Khan",
+        }
+        if domain_key in known_names:
+            name = known_names[domain_key]
+
+        logger.info("Website greeting name resolved: %s -> %s", website, name)
         return name
     except Exception as exc:
-        logger.warning(
-            "Gemini website-name formatting failed; using fallback: %s",
+        # Do not send an email with a potentially incorrect joined-up name.
+        logger.exception(
+            "Gemini website-name recognition failed; refusing to send with an unreliable greeting (%s).",
             type(exc).__name__,
         )
-        return fallback
+        raise RuntimeError(
+            "Could not reliably recognize the website/person name; email was not sent."
+        ) from exc
+
+
+def normalize_greeting(body):
+    """Ensure a greeting beginning with 'hello' is displayed as 'Hello'."""
+    if not body:
+        return body
+    return re.sub(r"(?im)^([ \\t]*)hello(?=\\s)", r"\\1Hello", body, count=1)
 
 
 def _formatting_tokens(value):
@@ -1024,6 +1061,7 @@ def process_sends(
             "{website_name}",
             website_name
         )
+        body = normalize_greeting(body)
 
         # Record SENDING before contacting SMTP.
         # If a run crashes here, manual review is required.
