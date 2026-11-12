@@ -28,7 +28,6 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv(
 ).strip()
 MAILBOXES_JSON = os.getenv("MAILBOXES_JSON", "").strip()
 HAMZA_SIGNATURE = os.getenv("HAMZA_SIGNATURE", "").strip()
-ARSLAN_SIGNATURE = os.getenv("ARSLAN_SIGNATURE", "").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -522,28 +521,12 @@ def ai_format_template(template):
 # MAILBOXES & WARMUP LIMITS
 # =========================================================
 
-def parse_signature(raw_sig):
-    if not raw_sig:
-        return ""
-    try:
-        parsed = json.loads(raw_sig)
-        if isinstance(parsed, dict):
-            return str(parsed.get("html", "")).strip()
-    except json.JSONDecodeError:
-        pass
-    return raw_sig.strip()
-
-
 def load_mailboxes():
     raw_mailboxes = json.loads(MAILBOXES_JSON)
     if not isinstance(raw_mailboxes, list):
         raise ValueError("MAILBOXES_JSON must be a JSON list.")
-    
-    hamza_html = parse_signature(HAMZA_SIGNATURE)
-    arslan_html = parse_signature(ARSLAN_SIGNATURE)
-
     active_mailboxes = []
-    for idx, mailbox in enumerate(raw_mailboxes):
+    for mailbox in raw_mailboxes:
         if not isinstance(mailbox, dict):
             raise ValueError("Each mailbox must be a JSON object.")
         if mailbox.get("active", True) is not True:
@@ -554,21 +537,11 @@ def load_mailboxes():
         mailbox["email"] = mailbox["email"].strip().lower()
         if not valid_email(mailbox["email"]):
             raise ValueError(f"Invalid mailbox email: {mailbox['email']}")
-        mailbox.setdefault("name", "Western Arsal")
+        mailbox.setdefault("name", mailbox["email"])
         mailbox.setdefault("smtp_port", 587)
         mailbox.setdefault("imap_host", mailbox["smtp_host"])
         mailbox.setdefault("imap_port", 993)
-
-        # Assign signatures automatically based on index
-        if idx == 0:
-            mailbox["signature"] = hamza_html
-        elif idx == 1:
-            mailbox["signature"] = arslan_html
-        else:
-            mailbox.setdefault("signature", "")
-
         active_mailboxes.append(mailbox)
-
     if not active_mailboxes:
         raise RuntimeError("No active mailboxes configured.")
     return active_mailboxes
@@ -855,6 +828,18 @@ def append_history(history_ws, recipient, website, mailbox, status, message_id="
     )
 
 
+def get_signature_html():
+    if not HAMZA_SIGNATURE:
+        raise RuntimeError("HAMZA_SIGNATURE secret is missing.")
+    try:
+        parsed = json.loads(HAMZA_SIGNATURE)
+        if isinstance(parsed, dict):
+            return str(parsed.get("html", "")).strip()
+    except json.JSONDecodeError:
+        pass
+    return HAMZA_SIGNATURE.strip()
+
+
 def remove_body_signoff(body):
     lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
     for index, line in enumerate(lines):
@@ -871,10 +856,7 @@ def html_signature_to_text(signature_html):
 
 
 def send_email(mailbox, recipient, subject, body):
-    signature_html = mailbox.get("signature", "").strip()
-    if not signature_html:
-        signature_html = '<div style="font-family: Arial, sans-serif; font-size: 14px;"><p>Best regards,<br><strong>Western Arsal</strong></p></div>'
-
+    signature_html = get_signature_html()
     clean_body = remove_body_signoff(body)
     signature_text = html_signature_to_text(signature_html)
 
