@@ -1,4 +1,3 @@
-
 name: Email Automation
 
 on:
@@ -17,7 +16,9 @@ concurrency:
 jobs:
   email-automation:
     name: Run Email Automation
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 10
 
     steps:
@@ -36,23 +37,20 @@ jobs:
 
       - name: Run Email Automation
         env:
-          # Google Sheets
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-
-          # Email Configuration
           MAILBOXES_JSON: ${{ secrets.MAILBOXES_JSON }}
           HAMZA_SIGNATURE: ${{ secrets.HAMZA_SIGNATURE }}
 
-          # AI API Keys
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
 
-          # AI Models
-          GEMINI_MODEL: gemini-2.5-flash
+          GEMINI_MODEL: auto
           OPENROUTER_MODEL: openrouter/auto
-          OLLAMA_MODEL: gemma4:31b
+          OLLAMA_MODEL: auto
+
+          OLLAMA_MODELS: "gemma4:31b,gpt-oss:120b,qwen3.5:cloud"
 
           PYTHONUNBUFFERED: "1"
 
