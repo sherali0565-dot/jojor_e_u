@@ -872,7 +872,13 @@ def send_email(mailbox, recipient, subject, body):
     message.set_content(plain_content)
 
     paragraphs = re.split(r"\n[ \t]*\n+", clean_body.replace("\r\n", "\n").strip()) if clean_body else []
-    body_html = "".join([f'<p style="margin:0 0 16px 0;">{html.escape(p).replace(chr(10), "<br>\\n")}</p>' for p in paragraphs])
+    
+    body_parts = []
+    for p in paragraphs:
+        escaped_p = html.escape(p).replace("\n", "<br>\n")
+        body_parts.append(f'<p style="margin:0 0 16px 0;">{escaped_p}</p>')
+    body_html = "".join(body_parts)
+
     html_content = f"<!doctype html><html><body><div style=\"font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#333;\">{body_html}<div style=\"margin-top:24px;\">{signature_html}</div></div></body></html>"
     message.add_alternative(html_content, subtype="html")
 
