@@ -2,8 +2,8 @@ name: Email Automation
 
 on:
   schedule:
+    # GitHub Actions runs approximately every 5 minutes (UTC).
     - cron: "*/5 * * * *"
-
   workflow_dispatch:
 
 permissions:
@@ -39,11 +39,8 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           MAILBOXES_JSON: ${{ secrets.MAILBOXES_JSON }}
           HAMZA_SIGNATURE: ${{ secrets.HAMZA_SIGNATURE }}
-
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: gemini-3.8-flash
-
-          DRY_RUN: ${{ secrets.DRY_RUN || 'false' }}
           PYTHONUNBUFFERED: "1"
 
         run: python main.py
