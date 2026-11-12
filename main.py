@@ -978,7 +978,8 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
 
         for attempt_num, mailbox in enumerate(attempts_to_try, start=1):
             last_mailbox_email = mailbox["email"]
-            append_history(history_rows, recipient, website, mailbox["email"], "SENDING", details=f"Attempt {attempt_num}", template_id=template_id)
+            # Fix: Pass history_ws instead of history_rows as the first argument
+            append_history(history_ws, recipient, website, mailbox["email"], "SENDING", details=f"Attempt {attempt_num}", template_id=template_id)
             sheets_retry(
                 websites_ws.update,
                 range_name=f"C{sheet_row}:G{sheet_row}",
@@ -986,7 +987,7 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
             )
             try:
                 message_id = send_email(mailbox, recipient, subject, body, mailboxes)
-                append_history(history_rows, recipient, website, mailbox["email"], "SENT", message_id, "Success", template_id=template_id)
+                append_history(history_ws, recipient, website, mailbox["email"], "SENT", message_id, "Success", template_id=template_id)
                 sheets_retry(
                     websites_ws.update,
                     range_name=f"C{sheet_row}:G{sheet_row}",
@@ -995,7 +996,7 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
                 return
             except Exception as exc:
                 last_exc = exc
-                append_history(history_rows, recipient, website, mailbox["email"], "FAILED", details=f"Attempt {attempt_num}: {type(exc).__name__}", template_id=template_id)
+                append_history(history_ws, recipient, website, mailbox["email"], "FAILED", details=f"Attempt {attempt_num}: {type(exc).__name__}", template_id=template_id)
                 if attempt_num < len(attempts_to_try):
                     time.sleep(2)
 
