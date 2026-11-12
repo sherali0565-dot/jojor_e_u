@@ -5,7 +5,6 @@ on:
   schedule:
     # GitHub scheduled runs are approximate; every 5 minutes.
     - cron: "*/5 * * * *"
-
   workflow_dispatch:
 
 permissions:
@@ -40,9 +39,13 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           MAILBOXES_JSON: ${{ secrets.MAILBOXES_JSON }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          HAMZA_SIGNATURE: ${{ secrets.HAMZA_SIGNATURE }}
 
+          # AI Providers
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+
+          HAMZA_SIGNATURE: ${{ secrets.HAMZA_SIGNATURE }}
           DRY_RUN: ${{ secrets.DRY_RUN || 'false' }}
           PYTHONUNBUFFERED: "1"
 
