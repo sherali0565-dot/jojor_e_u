@@ -33,7 +33,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install gspread google-auth
+          python -m pip install gspread google-auth google-genai
 
       - name: Run Email Automation
         env:
@@ -43,7 +43,6 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           HAMZA_SIGNATURE: ${{ secrets.HAMZA_SIGNATURE }}
 
-          # Real sending enabled by default. Set DRY_RUN=true only for testing.
           DRY_RUN: ${{ secrets.DRY_RUN || 'false' }}
           PYTHONUNBUFFERED: "1"
 
