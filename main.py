@@ -30,6 +30,8 @@ MAILBOXES_JSON = os.getenv("MAILBOXES_JSON", "").strip()
 HAMZA_SIGNATURE = os.getenv("HAMZA_SIGNATURE", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+# Optional second model, configured through a GitHub Actions environment variable.
+GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
 GEMINI_CLIENT = None
 
 EASTERN_TZ = ZoneInfo("America/New_York")
@@ -339,6 +341,64 @@ def get_gemini_client():
     return GEMINI_CLIENT
 
 
+def gemini_generate_content(*, contents, config, task_name):
+    """Call Gemini with bounded retries and an optional secondary model.
+
+    Only transient service/rate-limit/network failures are retried. Invalid API
+    keys, permission errors, and malformed requests are not repeatedly retried.
+    """
+    client = get_gemini_client()
+    models = [GEMINI_MODEL]
+    if GEMINI_FALLBACK_MODEL and GEMINI_FALLBACK_MODEL != GEMINI_MODEL:
+        models.append(GEMINI_FALLBACK_MODEL)
+
+    retry_delays = (2, 5, 10)  # seconds before attempts 2, 3, and 4
+    last_error = None
+
+    for model in models:
+        for attempt in range(len(retry_delays) + 1):
+            try:
+                logger.info(
+                    "Gemini task=%s model=%s attempt=%d/%d",
+                    task_name, model, attempt + 1, len(retry_delays) + 1,
+                )
+                return client.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+            except Exception as exc:
+                last_error = exc
+                message = str(exc).lower()
+                status_code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                transient = (
+                    status_code in (408, 429, 500, 502, 503, 504)
+                    or any(marker in message for marker in (
+                        "503", "unavailable", "high demand", "429",
+                        "resource_exhausted", "rate limit", "deadline exceeded",
+                        "timed out", "timeout", "temporarily",
+                        "connection reset", "service unavailable",
+                    ))
+                )
+                if not transient:
+                    raise
+                if attempt < len(retry_delays):
+                    delay = retry_delays[attempt]
+                    logger.warning(
+                        "Transient Gemini failure for %s (model=%s, attempt=%d/%d, error=%s); retrying in %ds.",
+                        task_name, model, attempt + 1, len(retry_delays) + 1,
+                        type(exc).__name__, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.warning(
+                        "Gemini retries exhausted for %s using model %s.",
+                        task_name, model,
+                    )
+
+    raise RuntimeError(
+        f"Gemini task '{task_name}' failed after retries for configured model(s)."
+    ) from last_error
+
+
 def gemini_website_name(website):
     """Convert a domain into a correctly spaced, title-cased display name."""
     fallback = fallback_clean_website_name(website)
@@ -354,8 +414,8 @@ def gemini_website_name(website):
             "properties": {"website_name": {"type": "STRING"}},
             "required": ["website_name"],
         }
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
+        response = gemini_generate_content(
+            task_name="website_name",
             contents=(
                 "You format website domains as the human-readable name of the "
                 "person, publisher, or brand being contacted. This is for the "
@@ -391,50 +451,13 @@ def gemini_website_name(website):
         if (not name or len(name) > 80 or
                 not re.fullmatch(r"[A-Za-z0-9]+(?:[ '-][A-Za-z0-9]+)*", name)):
             raise ValueError("Gemini returned an invalid website name")
-
-        # Normalize capitalization even if Gemini returns lower/title-mixed text.
-        name = " ".join(
-            word[0].upper() + word[1:].lower() if word else word
-            for word in name.split()
-        )
-
-        # Known joined-name spelling: preserve the correct human name even when
-        # the source domain is entirely lowercase and has no word boundary.
-        domain = str(website).strip()
-        domain = re.sub(r"^https?://", "", domain, flags=re.IGNORECASE)
-        domain = re.sub(r"^www\\.", "", domain, flags=re.IGNORECASE)
-        domain = re.split(r"[/\\?#]", domain, maxsplit=1)[0]
-        domain = re.sub(
-            r"\\.(co\\.uk|org\\.uk|com\\.au|net\\.au|co\\.nz|com\\.pk|co\\.in|com|net|org|io|biz|info|edu|gov|pk|uk|us|ca|au|de|fr|in)$",
-            "",
-            domain,
-            flags=re.IGNORECASE,
-        )
-        domain_key = re.sub(r"[^a-z]", "", domain.lower())
-        known_names = {
-            "hamzakhan": "Hamza Khan",
-        }
-        if domain_key in known_names:
-            name = known_names[domain_key]
-
-        logger.info("Website greeting name resolved: %s -> %s", website, name)
         return name
     except Exception as exc:
-        # Do not send an email with a potentially incorrect joined-up name.
-        logger.exception(
-            "Gemini website-name recognition failed; refusing to send with an unreliable greeting (%s).",
+        logger.warning(
+            "Gemini website-name formatting failed; using fallback: %s",
             type(exc).__name__,
         )
-        raise RuntimeError(
-            "Could not reliably recognize the website/person name; email was not sent."
-        ) from exc
-
-
-def normalize_greeting(body):
-    """Ensure a greeting beginning with 'hello' is displayed as 'Hello'."""
-    if not body:
-        return body
-    return re.sub(r"(?im)^([ \\t]*)hello(?=\\s)", r"\\1Hello", body, count=1)
+        return fallback
 
 
 def _formatting_tokens(value):
@@ -457,8 +480,8 @@ def gemini_format_template(template):
             },
             "required": ["subject", "body"],
         }
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
+        response = gemini_generate_content(
+            task_name="template_formatting",
             contents=(
                 "You are a strict email-formatting assistant. Your ONLY task is to improve "
                 "layout using whitespace, line breaks, and paragraph spacing. Use one blank "
@@ -973,8 +996,7 @@ def process_sends(
     suppressed = get_suppressed_emails(suppression_ws)
     contacted = get_contacted_emails(history_ws)
 
-    # One email is processed per workflow run.
-    # Sending frequency is controlled by the GitHub Actions YAML schedule.
+    # No Python-side inter-send delay: GitHub Actions YAML controls the schedule.
 
     mailbox = get_next_mailbox(mailboxes, history_ws)
     logger.info("Selected sending mailbox: %s", mailbox["email"])
@@ -1053,7 +1075,6 @@ def process_sends(
             "{website_name}",
             website_name
         )
-        body = normalize_greeting(body)
 
         # Record SENDING before contacting SMTP.
         # If a run crashes here, manual review is required.
