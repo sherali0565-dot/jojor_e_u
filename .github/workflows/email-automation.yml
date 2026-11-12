@@ -2,9 +2,8 @@ name: Email Automation
 
 on:
   schedule:
-    # GitHub scheduled runs are approximate; every 5 minutes.
+    # GitHub Actions runs approximately every 5 minutes (UTC).
     - cron: "*/5 * * * *"
-
   workflow_dispatch:
 
 permissions:
@@ -32,7 +31,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install gspread google-auth
+          pip install gspread google-auth google-genai
 
       - name: Run Email Automation
         env:
@@ -40,9 +39,8 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           MAILBOXES_JSON: ${{ secrets.MAILBOXES_JSON }}
           HAMZA_SIGNATURE: ${{ secrets.HAMZA_SIGNATURE }}
-
-          # Real sending enabled by default. Set DRY_RUN=true only for testing.
-          DRY_RUN: ${{ secrets.DRY_RUN || 'false' }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: gemini-3.8-flash
           PYTHONUNBUFFERED: "1"
 
         run: python main.py
