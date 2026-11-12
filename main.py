@@ -33,7 +33,6 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 GEMINI_CLIENT = None
 
 EASTERN_TZ = ZoneInfo("America/New_York")
-SEND_INTERVAL_SECONDS = 5 * 60  # Minimum 5 minutes between successful emails
 DAILY_LIMIT_PER_MAILBOX = 10
 
 SEND_START_HOUR = 8
@@ -974,15 +973,8 @@ def process_sends(
     suppressed = get_suppressed_emails(suppression_ws)
     contacted = get_contacted_emails(history_ws)
 
-    # One email is processed per run, with a minimum 5-minute gap between sends.
-    # Enforce at least 5 minutes between every successful email,
-    # including the first email in a newly added batch.
-    last_send = last_successful_send(history_ws)
-    if last_send:
-        elapsed = (now_local() - last_send).total_seconds()
-        if elapsed < SEND_INTERVAL_SECONDS:
-            logger.info("5-minute sending interval active; next send is not due yet.")
-            return
+    # One email is processed per workflow run.
+    # Sending frequency is controlled by the GitHub Actions YAML schedule.
 
     mailbox = get_next_mailbox(mailboxes, history_ws)
     logger.info("Selected sending mailbox: %s", mailbox["email"])
