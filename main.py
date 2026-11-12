@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -24,7 +23,9 @@ from email.utils import formataddr, make_msgid, parseaddr
 # =========================================================
 
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
-GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv(
+    "GOOGLE_SERVICE_ACCOUNT_JSON", ""
+).strip()
 MAILBOXES_JSON = os.getenv("MAILBOXES_JSON", "").strip()
 HAMZA_SIGNATURE = os.getenv("HAMZA_SIGNATURE", "").strip()
 
@@ -32,20 +33,36 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
 
-GEMINI_MODEL = os.getenv(
-    "GEMINI_MODEL", "gemini-2.5-flash"
-).strip()
+# Set to "auto" for automatic Gemini model discovery.
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "auto").strip()
 
+# OpenRouter automatic routing.
 OPENROUTER_MODEL = os.getenv(
     "OPENROUTER_MODEL", "openrouter/auto"
 ).strip()
 
-OLLAMA_MODEL = os.getenv(
-    "OLLAMA_MODEL", "gemma4:31b"
-).strip()
+# Set to "auto" to try the candidate models below.
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "auto").strip()
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/"
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Optional comma-separated Ollama model candidates.
+OLLAMA_MODELS = [
+    model.strip()
+    for model in os.getenv(
+        "OLLAMA_MODELS",
+        "gemma4:31b,gpt-oss:120b,qwen3.5:cloud"
+    ).split(",")
+    if model.strip()
+]
+
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+)
+GEMINI_MODELS_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models"
+)
+OPENROUTER_URL = (
+    "https://openrouter.ai/api/v1/chat/completions"
+)
 OLLAMA_URL = "https://ollama.com/api/chat"
 
 AI_CONNECT_TIMEOUT = 5
@@ -70,6 +87,8 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+_GEMINI_DISCOVERED_MODEL = None
+
 
 # =========================================================
 # GOOGLE SHEETS
@@ -79,36 +98,29 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets"
 ]
 
-
 HEADERS = {
     "Websites": [
         "Website", "Email", "Status", "Task ID",
         "Created At", "Last Sent At", "Mailbox",
         "Reply Status", "Notes"
     ],
-
     "Templates": [
         "Template ID", "Subject", "Body", "Active"
     ],
-
     "History": [
         "Timestamp", "Date", "Email", "Website",
         "Mailbox", "Status", "Message ID", "Details"
     ],
-
     "Replies": [
         "Received At", "From", "Subject",
         "Message ID", "Classification", "Snippet"
     ],
-
     "Dashboard": [
         "Metric", "Value"
     ],
-
     "Suppression": [
         "Email", "Reason", "Added At"
     ],
-
     "Run Log": [
         "Timestamp", "Level", "Event", "Details"
     ]
@@ -127,7 +139,6 @@ def connect_google_sheets():
     )
 
     client = gspread.authorize(credentials)
-
     return client.open_by_key(GOOGLE_SHEET_ID)
 
 
@@ -138,19 +149,17 @@ def setup_tabs(spreadsheet):
     }
 
     for name, headers in HEADERS.items():
-
         if name not in existing:
             ws = spreadsheet.add_worksheet(
                 title=name,
                 rows=1000,
                 cols=max(len(headers), 10)
             )
-
+            end_column = chr(64 + len(headers))
             ws.update(
-                range_name=f"A1:{chr(64 + len(headers))}1",
+                range_name=f"A1:{end_column}1",
                 values=[headers]
             )
-
             logger.info("Created worksheet: %s", name)
             continue
 
@@ -158,8 +167,9 @@ def setup_tabs(spreadsheet):
         current = ws.row_values(1)
 
         if not current:
+            end_column = chr(64 + len(headers))
             ws.update(
-                range_name=f"A1:{chr(64 + len(headers))}1",
+                range_name=f"A1:{end_column}1",
                 values=[headers]
             )
             continue
@@ -217,7 +227,6 @@ def valid_email(address):
         r"^[A-Za-z0-9._%+-]+@"
         r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}$"
     )
-
     return bool(re.fullmatch(pattern, address.strip()))
 
 
@@ -232,7 +241,6 @@ def decode_text(value):
     result = []
 
     for part, encoding in decode_header(value):
-
         if isinstance(part, bytes):
             result.append(
                 part.decode(
@@ -253,19 +261,11 @@ def fallback_clean_website_name(website):
     name = str(website).strip()
 
     name = re.sub(
-        r"^https?://",
-        "",
-        name,
-        flags=re.IGNORECASE
+        r"^https?://", "", name, flags=re.IGNORECASE
     )
-
     name = re.sub(
-        r"^www\.",
-        "",
-        name,
-        flags=re.IGNORECASE
+        r"^www\.", "", name, flags=re.IGNORECASE
     )
-
     name = re.split(r"[/\?#]", name, maxsplit=1)[0]
 
     suffixes = (
@@ -309,7 +309,6 @@ def parse_ai_json(value):
 
     try:
         return json.loads(value)
-
     except json.JSONDecodeError:
         start = value.find("{")
         end = value.rfind("}")
@@ -325,13 +324,118 @@ def ai_request_timeout():
 
 
 # =========================================================
+# AI ERROR HELPERS
+# =========================================================
+
+def get_http_status(exc):
+    response = getattr(exc, "response", None)
+    return getattr(response, "status_code", None)
+
+
+def is_transient_ai_error(exc):
+    status_code = get_http_status(exc)
+
+    if status_code in (408, 425, 429, 500, 502, 503, 504):
+        return True
+
+    return isinstance(
+        exc,
+        (
+            requests.Timeout,
+            requests.ConnectionError
+        )
+    )
+
+
+def log_provider_error(provider, exc):
+    status_code = get_http_status(exc)
+
+    logger.warning(
+        "AI FAILURE | Provider=%s | HTTP=%s | Error=%s | Message=%s",
+        provider,
+        status_code,
+        type(exc).__name__,
+        str(exc)[:300]
+    )
+
+
+# =========================================================
+# GEMINI MODEL DISCOVERY
+# =========================================================
+
+def discover_gemini_model():
+    global _GEMINI_DISCOVERED_MODEL
+
+    if GEMINI_MODEL.lower() != "auto":
+        return GEMINI_MODEL
+
+    if _GEMINI_DISCOVERED_MODEL:
+        return _GEMINI_DISCOVERED_MODEL
+
+    response = requests.get(
+        GEMINI_MODELS_URL,
+        params={"key": GEMINI_API_KEY},
+        timeout=ai_request_timeout()
+    )
+    response.raise_for_status()
+
+    models = response.json().get("models", [])
+
+    available = []
+
+    for model in models:
+        name = str(model.get("name", "")).strip()
+        methods = model.get("supportedGenerationMethods", [])
+
+        if not name or "generateContent" not in methods:
+            continue
+
+        short_name = name.split("/")[-1]
+
+        if "flash" in short_name.lower():
+            available.append(short_name)
+
+    if not available:
+        raise RuntimeError(
+            "Gemini discovery found no available Flash model."
+        )
+
+    # Prefer stable Flash model names over preview/experimental names.
+    stable = [
+        model for model in available
+        if "preview" not in model.lower()
+        and "experimental" not in model.lower()
+    ]
+
+    choices = stable or available
+
+    # Prefer 2.5 Flash if it is available.
+    preferred = [
+        model for model in choices
+        if model.lower() == "gemini-2.5-flash"
+    ]
+
+    selected = preferred[0] if preferred else sorted(choices)[0]
+
+    _GEMINI_DISCOVERED_MODEL = selected
+
+    logger.info(
+        "Gemini automatic model selection: %s",
+        selected
+    )
+
+    return selected
+
+
+# =========================================================
 # GEMINI PROVIDER
 # =========================================================
 
 def call_gemini(contents, config):
-
     if not GEMINI_API_KEY:
         raise RuntimeError("Gemini API key missing.")
+
+    model = discover_gemini_model()
 
     generation_config = {
         "temperature": config.get("temperature", 0),
@@ -355,16 +459,14 @@ def call_gemini(contents, config):
     }
 
     response = requests.post(
-        f"{GEMINI_URL}{GEMINI_MODEL}:generateContent",
+        f"{GEMINI_URL}{model}:generateContent",
         params={"key": GEMINI_API_KEY},
         json=payload,
         timeout=ai_request_timeout()
     )
-
     response.raise_for_status()
 
     data = response.json()
-
     candidates = data.get("candidates", [])
 
     if not candidates:
@@ -391,7 +493,6 @@ def call_gemini(contents, config):
 # =========================================================
 
 def call_openrouter(contents, config):
-
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OpenRouter API key missing.")
 
@@ -422,11 +523,9 @@ def call_openrouter(contents, config):
         json=payload,
         timeout=ai_request_timeout()
     )
-
     response.raise_for_status()
 
     data = response.json()
-
     choices = data.get("choices", [])
 
     if not choices:
@@ -455,50 +554,94 @@ def call_openrouter(contents, config):
 # OLLAMA CLOUD PROVIDER
 # =========================================================
 
-def call_ollama(contents, config):
+def get_ollama_candidates():
+    if OLLAMA_MODEL.lower() != "auto":
+        return [OLLAMA_MODEL]
 
+    if not OLLAMA_MODELS:
+        raise RuntimeError(
+            "No Ollama model candidates configured."
+        )
+
+    return OLLAMA_MODELS
+
+
+def call_ollama(contents, config):
     if not OLLAMA_API_KEY:
         raise RuntimeError("Ollama API key missing.")
-
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": str(contents)
-            }
-        ],
-        "stream": False,
-        "format": "json",
-        "options": {
-            "temperature": config.get("temperature", 0)
-        }
-    }
 
     headers = {
         "Authorization": f"Bearer {OLLAMA_API_KEY}",
         "Content-Type": "application/json"
     }
 
-    response = requests.post(
-        OLLAMA_URL,
-        headers=headers,
-        json=payload,
-        timeout=ai_request_timeout()
-    )
+    last_error = None
+    candidates = get_ollama_candidates()
 
-    response.raise_for_status()
+    for model in candidates:
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": str(contents)
+                }
+            ],
+            "stream": False,
+            "format": "json",
+            "options": {
+                "temperature": config.get("temperature", 0)
+            }
+        }
 
-    data = response.json()
+        try:
+            logger.info(
+                "Trying Ollama model: %s",
+                model
+            )
 
-    result = data.get(
-        "message", {}
-    ).get("content", "")
+            response = requests.post(
+                OLLAMA_URL,
+                headers=headers,
+                json=payload,
+                timeout=ai_request_timeout()
+            )
+            response.raise_for_status()
 
-    if not result:
-        raise RuntimeError("Ollama returned empty response.")
+            data = response.json()
 
-    return result.strip()
+            result = data.get(
+                "message", {}
+            ).get("content", "")
+
+            if not result:
+                raise RuntimeError(
+                    f"Ollama model {model} returned empty response."
+                )
+
+            logger.info(
+                "Ollama model selected successfully: %s",
+                model
+            )
+
+            return result.strip()
+
+        except Exception as exc:
+            last_error = exc
+            log_provider_error(f"Ollama/{model}", exc)
+
+            # If the model is unavailable, immediately try the next.
+            status_code = get_http_status(exc)
+
+            if status_code in (400, 404, 422):
+                continue
+
+            # Other errors go to the main provider failover.
+            raise
+
+    raise RuntimeError(
+        "All configured Ollama model candidates failed."
+    ) from last_error
 
 
 # =========================================================
@@ -506,7 +649,6 @@ def call_ollama(contents, config):
 # =========================================================
 
 def gemini_generate_content(*, contents, config, task_name):
-
     providers = [
         ("Gemini", GEMINI_API_KEY, call_gemini),
         ("OpenRouter", OPENROUTER_API_KEY, call_openrouter),
@@ -516,7 +658,6 @@ def gemini_generate_content(*, contents, config, task_name):
     last_error = None
 
     for provider_name, api_key, provider_function in providers:
-
         if not api_key:
             logger.warning(
                 "AI provider skipped: %s API key missing.",
@@ -527,9 +668,7 @@ def gemini_generate_content(*, contents, config, task_name):
         max_attempts = len(AI_RETRY_DELAYS) + 1
 
         for attempt in range(max_attempts):
-
             try:
-
                 logger.info(
                     "AI task=%s | Provider=%s | Attempt=%d/%d",
                     task_name,
@@ -552,38 +691,13 @@ def gemini_generate_content(*, contents, config, task_name):
                 return result
 
             except Exception as exc:
-
                 last_error = exc
+                log_provider_error(provider_name, exc)
 
-                status_code = getattr(
-                    getattr(exc, "response", None),
-                    "status_code",
-                    None
-                )
-
-                transient = (
-                    status_code in (
-                        408, 425, 429,
-                        500, 502, 503, 504
-                    )
-                    or isinstance(
-                        exc,
-                        (
-                            requests.Timeout,
-                            requests.ConnectionError
-                        )
-                    )
-                )
-
-                logger.warning(
-                    "AI FAILURE | Provider=%s | HTTP=%s | Error=%s",
-                    provider_name,
-                    status_code,
-                    type(exc).__name__
-                )
-
-                if transient and attempt < len(AI_RETRY_DELAYS):
-
+                if (
+                    is_transient_ai_error(exc)
+                    and attempt < len(AI_RETRY_DELAYS)
+                ):
                     delay = AI_RETRY_DELAYS[attempt]
 
                     logger.warning(
@@ -595,6 +709,8 @@ def gemini_generate_content(*, contents, config, task_name):
                     time.sleep(delay)
                     continue
 
+                # Non-transient errors, including 400/401/403/404,
+                # immediately move to the next provider.
                 break
 
     raise RuntimeError(
@@ -607,7 +723,6 @@ def gemini_generate_content(*, contents, config, task_name):
 # =========================================================
 
 def gemini_website_name(website):
-
     fallback = fallback_clean_website_name(website)
 
     if not website:
@@ -640,7 +755,6 @@ def gemini_website_name(website):
     )
 
     try:
-
         response_text = gemini_generate_content(
             contents=prompt,
             config={
@@ -669,12 +783,10 @@ def gemini_website_name(website):
         return name
 
     except Exception as exc:
-
         logger.warning(
             "Website name AI failed. Using fallback. Error=%s",
             type(exc).__name__
         )
-
         return fallback
 
 
@@ -691,7 +803,6 @@ def formatting_tokens(value):
 
 
 def gemini_format_template(template):
-
     original_subject = template["subject"]
     original_body = template["body"]
 
@@ -724,7 +835,6 @@ def gemini_format_template(template):
     )
 
     try:
-
         response_text = gemini_generate_content(
             contents=prompt,
             config={
@@ -758,12 +868,10 @@ def gemini_format_template(template):
         }
 
     except Exception as exc:
-
         logger.warning(
             "Template formatting failed. Original retained. Error=%s",
             type(exc).__name__
         )
-
         return template
 
 
@@ -772,7 +880,6 @@ def gemini_format_template(template):
 # =========================================================
 
 def load_mailboxes():
-
     raw = json.loads(MAILBOXES_JSON)
 
     if not isinstance(raw, list):
@@ -781,7 +888,6 @@ def load_mailboxes():
     active = []
 
     for mailbox in raw:
-
         if not isinstance(mailbox, dict):
             raise ValueError("Each mailbox must be a JSON object.")
 
@@ -830,7 +936,6 @@ def load_mailboxes():
 # =========================================================
 
 def is_send_time():
-
     current = now_local()
 
     if current.weekday() >= 5:
@@ -858,7 +963,6 @@ def append_history(
     message_id="",
     details=""
 ):
-
     history_ws.append_row([
         timestamp(),
         now_local().date().isoformat(),
@@ -872,7 +976,6 @@ def append_history(
 
 
 def get_suppressed_emails(ws):
-
     return {
         normalize_email(row.get("Email", ""))
         for row in get_rows(ws)
@@ -881,16 +984,11 @@ def get_suppressed_emails(ws):
 
 
 def get_contacted_emails(ws):
-
     contacted = set()
 
     for row in get_rows(ws):
-
         if str(row.get("Status", "")).upper() == "SENT":
-
-            address = normalize_email(
-                row.get("Email", "")
-            )
+            address = normalize_email(row.get("Email", ""))
 
             if address:
                 contacted.add(address)
@@ -899,14 +997,12 @@ def get_contacted_emails(ws):
 
 
 def add_to_suppression(ws, address, reason):
-
     address = normalize_email(address)
 
     if not address:
         return
 
     if address not in get_suppressed_emails(ws):
-
         ws.append_row([
             address,
             reason,
@@ -919,15 +1015,11 @@ def add_to_suppression(ws, address, reason):
 # =========================================================
 
 def get_next_mailbox(mailboxes, history_ws):
-
     rows = get_rows(history_ws)
-
     last_mailbox = None
 
     for row in reversed(rows):
-
         if str(row.get("Status", "")).upper() == "SENT":
-
             last_mailbox = normalize_email(
                 row.get("Mailbox", "")
             )
@@ -942,19 +1034,16 @@ def get_next_mailbox(mailboxes, history_ws):
         return mailboxes[0]
 
     index = addresses.index(last_mailbox)
-
     return mailboxes[(index + 1) % len(mailboxes)]
 
 
 def daily_sent_count(history_ws, mailbox_email):
-
     today = now_local().date().isoformat()
     mailbox_email = normalize_email(mailbox_email)
 
     count = 0
 
     for row in get_rows(history_ws):
-
         if str(row.get("Date", "")) != today:
             continue
 
@@ -972,24 +1061,20 @@ def daily_sent_count(history_ws, mailbox_email):
 # =========================================================
 
 def get_signature_html():
-
     if not HAMZA_SIGNATURE:
         raise RuntimeError(
             "HAMZA_SIGNATURE is missing. Email not sent."
         )
 
     try:
-
         parsed = json.loads(HAMZA_SIGNATURE)
 
         if isinstance(parsed, dict):
             signature = str(
                 parsed.get("html", "")
             ).strip()
-
         elif isinstance(parsed, str):
             signature = parsed.strip()
-
         else:
             signature = HAMZA_SIGNATURE
 
@@ -1003,7 +1088,6 @@ def get_signature_html():
 
 
 def remove_body_signoff(body):
-
     normalized = (body or "").replace(
         "\r\n", "\n"
     ).replace("\r", "\n")
@@ -1011,7 +1095,6 @@ def remove_body_signoff(body):
     lines = normalized.split("\n")
 
     for index, line in enumerate(lines):
-
         if re.fullmatch(
             r"\s*best regards\s*,?\s*",
             line,
@@ -1023,7 +1106,6 @@ def remove_body_signoff(body):
 
 
 def html_signature_to_text(signature_html):
-
     value = re.sub(
         r"(?i)<\s*br\s*/?\s*>",
         "\n",
@@ -1037,9 +1119,7 @@ def html_signature_to_text(signature_html):
     )
 
     value = re.sub(r"<[^>]+>", "", value)
-
     value = html.unescape(value)
-
     value = re.sub(r"[ \t]+", " ", value)
 
     value = re.sub(
@@ -1056,9 +1136,7 @@ def html_signature_to_text(signature_html):
 # =========================================================
 
 def send_email(mailbox, recipient, subject, body):
-
     signature_html = get_signature_html()
-
     clean_body = remove_body_signoff(body)
 
     signature_text = html_signature_to_text(
@@ -1070,7 +1148,6 @@ def send_email(mailbox, recipient, subject, body):
     message["From"] = formataddr(
         ("Western Arsal", mailbox["email"])
     )
-
     message["To"] = recipient
     message["Subject"] = subject
     message["Message-ID"] = make_msgid()
@@ -1094,7 +1171,6 @@ def send_email(mailbox, recipient, subject, body):
     body_blocks = []
 
     for paragraph in paragraphs:
-
         paragraph_html = html.escape(
             paragraph
         ).replace("\n", "<br>\n")
@@ -1132,38 +1208,30 @@ def send_email(mailbox, recipient, subject, body):
     smtp_port = int(mailbox["smtp_port"])
 
     if smtp_port == 465:
-
         with smtplib.SMTP_SSL(
             smtp_host,
             smtp_port,
             context=context,
             timeout=30
         ) as server:
-
             server.login(
                 mailbox["email"],
                 mailbox["password"]
             )
-
             server.send_message(message)
-
     else:
-
         with smtplib.SMTP(
             smtp_host,
             smtp_port,
             timeout=30
         ) as server:
-
             server.ehlo()
             server.starttls(context=context)
             server.ehlo()
-
             server.login(
                 mailbox["email"],
                 mailbox["password"]
             )
-
             server.send_message(message)
 
     return message["Message-ID"]
@@ -1174,7 +1242,6 @@ def send_email(mailbox, recipient, subject, body):
 # =========================================================
 
 def discover_new_tasks(websites_ws, run_log_ws=None):
-
     values = websites_ws.get_all_values()
 
     if not values:
@@ -1208,7 +1275,6 @@ def discover_new_tasks(websites_ws, run_log_ws=None):
         )
 
     def cell(row, column):
-
         index = header_map[column]
 
         if index >= len(row):
@@ -1220,7 +1286,6 @@ def discover_new_tasks(websites_ws, run_log_ws=None):
     skipped = []
 
     for sheet_row, row in enumerate(values[1:], start=2):
-
         website = cell(row, "Website")
         recipient = normalize_email(cell(row, "Email"))
         status = cell(row, "Status")
@@ -1281,11 +1346,9 @@ def discover_new_tasks(websites_ws, run_log_ws=None):
 # =========================================================
 
 def get_active_templates(templates_ws):
-
     active = []
 
     for row in get_rows(templates_ws):
-
         template_id = str(
             row.get("Template ID", "")
         ).strip()
@@ -1320,7 +1383,6 @@ def get_active_templates(templates_ws):
 
 
 def select_template(templates, task_number):
-
     if not templates:
         return None
 
@@ -1339,8 +1401,6 @@ def process_sends(
     history_ws,
     suppression_ws
 ):
-
-    # Enforce the Eastern Time sending window.
     if not is_send_time():
         logger.info("Outside sending window. No email sent.")
         return
@@ -1352,7 +1412,6 @@ def process_sends(
         return
 
     rows = get_rows(websites_ws)
-
     suppressed = get_suppressed_emails(suppression_ws)
     contacted = get_contacted_emails(history_ws)
 
@@ -1365,7 +1424,6 @@ def process_sends(
         history_ws,
         mailbox["email"]
     ) >= DAILY_LIMIT_PER_MAILBOX:
-
         remaining = [
             m for m in mailboxes
             if daily_sent_count(
@@ -1386,7 +1444,6 @@ def process_sends(
     )
 
     for index, row in enumerate(rows):
-
         website = str(
             row.get("Website", "")
         ).strip()
@@ -1405,40 +1462,33 @@ def process_sends(
             continue
 
         if not website or not valid_email(recipient):
-
             websites_ws.update_cell(
                 sheet_row,
                 3,
                 "INVALID"
             )
-
             continue
 
         if recipient in suppressed:
-
             websites_ws.update_cell(
                 sheet_row,
                 3,
                 "SUPPRESSED"
             )
-
             continue
 
         if recipient in contacted:
-
             websites_ws.update_cell(
                 sheet_row,
                 3,
                 "ALREADY_CONTACTED"
             )
-
             continue
 
         if daily_sent_count(
             history_ws,
             mailbox["email"]
         ) >= DAILY_LIMIT_PER_MAILBOX:
-
             remaining = [
                 m for m in mailboxes
                 if daily_sent_count(
@@ -1459,7 +1509,6 @@ def process_sends(
         )
 
         template = gemini_format_template(template)
-
         website_name = gemini_website_name(website)
 
         subject = template["subject"].replace(
@@ -1493,7 +1542,6 @@ def process_sends(
         )
 
         try:
-
             message_id = send_email(
                 mailbox,
                 recipient,
@@ -1528,7 +1576,6 @@ def process_sends(
             )
 
         except Exception as exc:
-
             logger.exception("SMTP sending failed.")
 
             append_history(
@@ -1551,7 +1598,7 @@ def process_sends(
                 ]]
             )
 
-        # Only one recipient per workflow run.
+        # One recipient per workflow run.
         return
 
 
@@ -1560,7 +1607,6 @@ def process_sends(
 # =========================================================
 
 def classify_reply(subject, body):
-
     text = f"{subject} {body}".lower()
 
     if any(term in text for term in [
@@ -1585,13 +1631,10 @@ def classify_reply(subject, body):
 
 
 def extract_body(message):
-
     parts = []
 
     if message.is_multipart():
-
         for part in message.walk():
-
             if part.get_content_type() != "text/plain":
                 continue
 
@@ -1601,7 +1644,6 @@ def extract_body(message):
             payload = part.get_payload(decode=True)
 
             if payload:
-
                 charset = part.get_content_charset() or "utf-8"
 
                 parts.append(
@@ -1610,13 +1652,10 @@ def extract_body(message):
                         errors="replace"
                     )
                 )
-
     else:
-
         payload = message.get_payload(decode=True)
 
         if payload:
-
             charset = message.get_content_charset() or "utf-8"
 
             parts.append(
@@ -1639,7 +1678,6 @@ def read_replies(
     suppression_ws,
     websites_ws
 ):
-
     existing_ids = {
         str(row.get("Message ID", "")).strip()
         for row in get_rows(replies_ws)
@@ -1647,11 +1685,9 @@ def read_replies(
     }
 
     for mailbox in mailboxes:
-
         connection = None
 
         try:
-
             connection = imaplib.IMAP4_SSL(
                 mailbox["imap_host"],
                 int(mailbox.get("imap_port", 993)),
@@ -1686,9 +1722,7 @@ def read_replies(
             )
 
             for number in numbers:
-
                 try:
-
                     status, message_data = connection.fetch(
                         number,
                         "(RFC822)"
@@ -1708,13 +1742,11 @@ def read_replies(
                     ).strip()
 
                     if message_id and message_id in existing_ids:
-
                         connection.store(
                             number,
                             "+FLAGS",
                             "\\Seen"
                         )
-
                         continue
 
                     from_address = normalize_email(
@@ -1755,7 +1787,6 @@ def read_replies(
                         "UNSUBSCRIBE",
                         "BOUNCE"
                     ):
-
                         add_to_suppression(
                             suppression_ws,
                             from_address,
@@ -1766,11 +1797,9 @@ def read_replies(
                         get_rows(websites_ws),
                         start=2
                     ):
-
                         if normalize_email(
                             website_row.get("Email", "")
                         ) == from_address:
-
                             websites_ws.update_cell(
                                 index,
                                 8,
@@ -1784,7 +1813,6 @@ def read_replies(
                     )
 
                 except Exception:
-
                     logger.exception(
                         "Could not process an individual IMAP message."
                     )
@@ -1795,16 +1823,13 @@ def read_replies(
             )
 
         except Exception:
-
             logger.exception(
                 "IMAP connection failed for %s",
                 mailbox["email"]
             )
 
         finally:
-
             if connection:
-
                 try:
                     connection.logout()
                 except Exception:
@@ -1821,7 +1846,6 @@ def update_dashboard(
     websites_ws,
     mailboxes
 ):
-
     history = get_rows(history_ws)
     websites = get_rows(websites_ws)
 
@@ -1834,7 +1858,6 @@ def update_dashboard(
     today = now_local().date().isoformat()
 
     for row in history:
-
         if str(row.get("Date", "")) != today:
             continue
 
@@ -1874,7 +1897,6 @@ def update_dashboard(
 # =========================================================
 
 def main():
-
     logger.info("=" * 60)
     logger.info("Email automation started.")
     logger.info(
@@ -1920,27 +1942,21 @@ def main():
     websites_ws = get_worksheet(
         spreadsheet, "Websites"
     )
-
     templates_ws = get_worksheet(
         spreadsheet, "Templates"
     )
-
     history_ws = get_worksheet(
         spreadsheet, "History"
     )
-
     replies_ws = get_worksheet(
         spreadsheet, "Replies"
     )
-
     dashboard_ws = get_worksheet(
         spreadsheet, "Dashboard"
     )
-
     suppression_ws = get_worksheet(
         spreadsheet, "Suppression"
     )
-
     run_log_ws = get_worksheet(
         spreadsheet, "Run Log"
     )
@@ -2028,15 +2044,12 @@ def main():
 
 
 if __name__ == "__main__":
-
     try:
         main()
 
     except Exception as exc:
-
         logger.exception(
             "FATAL: Email automation stopped: %s",
             exc
         )
-
         raise
