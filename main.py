@@ -29,7 +29,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip
 MAILBOXES_JSON = os.getenv("MAILBOXES_JSON", "").strip()
 HAMZA_SIGNATURE = os.getenv("HAMZA_SIGNATURE", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash").strip()
 # Optional second model, configured through a GitHub Actions environment variable.
 GEMINI_FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "").strip()
 GEMINI_CLIENT = None
