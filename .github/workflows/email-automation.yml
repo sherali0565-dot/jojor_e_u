@@ -33,7 +33,7 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install gspread google-auth requests
+          python -m pip install gspread google-auth requests beautifulsoup4
 
       - name: Run Email Automation
         env:
@@ -49,8 +49,6 @@ jobs:
           GEMINI_MODEL: auto
           OPENROUTER_MODEL: openrouter/auto
           OLLAMA_MODEL: auto
-
-          OLLAMA_MODELS: "gemma4:31b,gpt-oss:120b,qwen3.5:cloud"
 
           PYTHONUNBUFFERED: "1"
 
