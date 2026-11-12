@@ -28,6 +28,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv(
 ).strip()
 MAILBOXES_JSON = os.getenv("MAILBOXES_JSON", "").strip()
 HAMZA_SIGNATURE = os.getenv("HAMZA_SIGNATURE", "").strip()
+ARSLAN_SIGNATURE = os.getenv("ARSLAN_SIGNATURE", "").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -828,16 +829,25 @@ def append_history(history_ws, recipient, website, mailbox, status, message_id="
     )
 
 
-def get_signature_html():
-    if not HAMZA_SIGNATURE:
-        raise RuntimeError("HAMZA_SIGNATURE secret is missing.")
+def get_signature_html(mailbox, mailboxes):
+    mb_email = normalize_email(mailbox.get("email"))
+    index = 0
+    for i, m in enumerate(mailboxes):
+        if normalize_email(m.get("email")) == mb_email:
+            index = i
+            break
+    
+    sig_str = ARSLAN_SIGNATURE if index == 1 and ARSLAN_SIGNATURE else HAMZA_SIGNATURE
+    if not sig_str:
+        sig_str = HAMZA_SIGNATURE
+        
     try:
-        parsed = json.loads(HAMZA_SIGNATURE)
+        parsed = json.loads(sig_str)
         if isinstance(parsed, dict):
             return str(parsed.get("html", "")).strip()
     except json.JSONDecodeError:
         pass
-    return HAMZA_SIGNATURE.strip()
+    return sig_str.strip()
 
 
 def remove_body_signoff(body):
@@ -855,8 +865,8 @@ def html_signature_to_text(signature_html):
     return re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", html.unescape(text)).strip()
 
 
-def send_email(mailbox, recipient, subject, body):
-    signature_html = get_signature_html()
+def send_email(mailbox, recipient, subject, body, mailboxes):
+    signature_html = get_signature_html(mailbox, mailboxes)
     clean_body = remove_body_signoff(body)
     signature_text = html_signature_to_text(signature_html)
 
@@ -968,15 +978,15 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
 
         for attempt_num, mailbox in enumerate(attempts_to_try, start=1):
             last_mailbox_email = mailbox["email"]
-            append_history(history_ws, recipient, website, mailbox["email"], "SENDING", details=f"Attempt {attempt_num}", template_id=template_id)
+            append_history(history_rows, recipient, website, mailbox["email"], "SENDING", details=f"Attempt {attempt_num}", template_id=template_id)
             sheets_retry(
                 websites_ws.update,
                 range_name=f"C{sheet_row}:G{sheet_row}",
                 values=[["SENDING", row.get("Task ID", ""), row.get("Created At", ""), "", mailbox["email"]]]
             )
             try:
-                message_id = send_email(mailbox, recipient, subject, body)
-                append_history(history_ws, recipient, website, mailbox["email"], "SENT", message_id, "Success", template_id=template_id)
+                message_id = send_email(mailbox, recipient, subject, body, mailboxes)
+                append_history(history_rows, recipient, website, mailbox["email"], "SENT", message_id, "Success", template_id=template_id)
                 sheets_retry(
                     websites_ws.update,
                     range_name=f"C{sheet_row}:G{sheet_row}",
@@ -985,7 +995,7 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
                 return
             except Exception as exc:
                 last_exc = exc
-                append_history(history_ws, recipient, website, mailbox["email"], "FAILED", details=f"Attempt {attempt_num}: {type(exc).__name__}", template_id=template_id)
+                append_history(history_rows, recipient, website, mailbox["email"], "FAILED", details=f"Attempt {attempt_num}: {type(exc).__name__}", template_id=template_id)
                 if attempt_num < len(attempts_to_try):
                     time.sleep(2)
 
