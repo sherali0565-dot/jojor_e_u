@@ -65,7 +65,7 @@ AI_RETRY_DELAYS = (2,)
 
 EASTERN_TZ = ZoneInfo("America/New_York")
 
-DAILY_LIMIT_PER_MAILBOX = 15
+DAILY_LIMIT_PER_MAILBOX = 25
 
 # Sending allowed from SEND_START_HOUR up to (not including) SEND_END_HOUR,
 # Eastern time, except during the pause window.
