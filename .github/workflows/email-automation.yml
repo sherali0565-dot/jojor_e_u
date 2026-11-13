@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: email-automation
@@ -54,10 +54,3 @@ jobs:
           PYTHONUNBUFFERED: "1"
 
         run: python main.py
-
-      - name: Keep-Alive Activity Commit
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git commit --allow-empty -m "chore: keep-alive activity heartbeat [skip ci]"
-          git push
