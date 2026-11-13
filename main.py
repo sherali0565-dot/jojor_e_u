@@ -1000,6 +1000,10 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
     contacted = get_contacted_emails(history_rows)
 
     ordered_mailboxes = get_ordered_candidate_mailboxes(mailboxes, history_rows)
+    eligible_mailboxes = [
+    mb for mb in ordered_mailboxes
+    if daily_sent_count(history_rows, mb["email"]) < get_mailbox_daily_limit(mb, history_rows)
+]
 
     if not eligible_mailboxes:
         return
