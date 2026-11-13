@@ -60,10 +60,15 @@ EASTERN_TZ = ZoneInfo("America/New_York")
 
 DAILY_LIMIT_PER_MAILBOX = 10
 
+# Sending allowed from SEND_START_HOUR up to (not including) SEND_END_HOUR,
+# Eastern time, except during the pause window.
+# Set env IGNORE_SEND_WINDOW=1 to bypass (useful for manual tests).
 SEND_START_HOUR = 8
 SEND_END_HOUR = 16
 PAUSE_START_HOUR = 13
 PAUSE_END_HOUR = 14
+
+EMAIL_FINDER = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -244,6 +249,17 @@ def pending_task_count(rows):
     )
 
 
+def within_send_window():
+    if os.getenv("IGNORE_SEND_WINDOW", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    hour = now_local().hour
+    if hour < SEND_START_HOUR or hour >= SEND_END_HOUR:
+        return False
+    if PAUSE_START_HOUR <= hour < PAUSE_END_HOUR:
+        return False
+    return True
+
+
 # =========================================================
 # GENERAL HELPERS & AI
 # =========================================================
@@ -268,12 +284,15 @@ def decode_text(value):
     result = []
     for part, encoding in decode_header(value):
         if isinstance(part, bytes):
-            result.append(
-                part.decode(
-                    encoding or "utf-8",
-                    errors="replace"
+            try:
+                result.append(
+                    part.decode(
+                        encoding or "utf-8",
+                        errors="replace"
+                    )
                 )
-            )
+            except LookupError:
+                result.append(part.decode("utf-8", errors="replace"))
         else:
             result.append(part)
     return "".join(result)
@@ -708,8 +727,9 @@ def archive_old_logs(spreadsheet, history_ws, run_log_ws, retention_days=30):
                 sheets_retry(history_ws.update, range_name=f"A1:{column_letter(len(headers))}1", values=[headers])
                 if keep_rows:
                     sheets_retry(history_ws.append_rows, keep_rows)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.exception("History archiving failed.")
+        write_run_log(run_log_ws, "ERROR", "ARCHIVE_HISTORY_FAILED", repr(exc))
 
     try:
         run_archive_ws = get_worksheet(spreadsheet, "Run Log Archive")
@@ -732,7 +752,7 @@ def archive_old_logs(spreadsheet, history_ws, run_log_ws, retention_days=30):
                 if keep_logs:
                     sheets_retry(run_log_ws.append_rows, keep_logs)
     except Exception:
-        pass
+        logger.exception("Run Log archiving failed.")
 
 
 def discover_new_tasks(websites_ws, run_log_ws=None):
@@ -829,29 +849,48 @@ def append_history(history_ws, recipient, website, mailbox, status, message_id="
     )
 
 
+def _parse_signature(sig_str):
+    """Accepts raw HTML, a JSON string, or a JSON object with an 'html' key."""
+    sig_str = (sig_str or "").strip()
+    if not sig_str:
+        return ""
+    try:
+        parsed = json.loads(sig_str)
+        if isinstance(parsed, dict):
+            return str(parsed.get("html", "")).strip()
+        if isinstance(parsed, str):
+            return parsed.strip()
+    except json.JSONDecodeError:
+        pass
+    return sig_str
+
+
 def get_signature_html(mailbox, mailboxes):
+    # 1st mailbox -> HAMZA_SIGNATURE, 2nd mailbox -> ARSLAN_SIGNATURE,
+    # any other mailbox -> HAMZA_SIGNATURE. If ARSLAN_SIGNATURE is empty,
+    # the 2nd mailbox falls back to HAMZA_SIGNATURE.
     mb_email = normalize_email(mailbox.get("email"))
     index = 0
     for i, m in enumerate(mailboxes):
         if normalize_email(m.get("email")) == mb_email:
             index = i
             break
-    
+
     sig_str = ARSLAN_SIGNATURE if index == 1 and ARSLAN_SIGNATURE else HAMZA_SIGNATURE
-    if not sig_str:
-        sig_str = HAMZA_SIGNATURE
-        
-    try:
-        parsed = json.loads(sig_str)
-        if isinstance(parsed, dict):
-            return str(parsed.get("html", "")).strip()
-    except json.JSONDecodeError:
-        pass
-    return sig_str.strip()
+    signature = _parse_signature(sig_str)
+
+    if not signature:
+        # Never send an email without a signature.
+        raise RuntimeError(
+            "Signature is empty (check HAMZA_SIGNATURE / ARSLAN_SIGNATURE). "
+            "Email was not sent."
+        )
+    return signature
 
 
 def remove_body_signoff(body):
-    lines = (body or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    body = body or ""
+    lines = body.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     for index, line in enumerate(lines):
         if re.fullmatch(r"\s*best regards\s*,?\s*", line, flags=re.IGNORECASE):
             return "\n".join(lines[:index]).rstrip()
@@ -882,7 +921,7 @@ def send_email(mailbox, recipient, subject, body, mailboxes):
     message.set_content(plain_content)
 
     paragraphs = re.split(r"\n[ \t]*\n+", clean_body.replace("\r\n", "\n").strip()) if clean_body else []
-    
+
     body_parts = []
     for p in paragraphs:
         escaped_p = html.escape(p).replace("\n", "<br>\n")
@@ -978,7 +1017,6 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
 
         for attempt_num, mailbox in enumerate(attempts_to_try, start=1):
             last_mailbox_email = mailbox["email"]
-            # Fix: Pass history_ws instead of history_rows as the first argument
             append_history(history_ws, recipient, website, mailbox["email"], "SENDING", details=f"Attempt {attempt_num}", template_id=template_id)
             sheets_retry(
                 websites_ws.update,
@@ -996,6 +1034,7 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
                 return
             except Exception as exc:
                 last_exc = exc
+                logger.warning("Send failed via %s: %s", mailbox["email"], exc)
                 append_history(history_ws, recipient, website, mailbox["email"], "FAILED", details=f"Attempt {attempt_num}: {type(exc).__name__}", template_id=template_id)
                 if attempt_num < len(attempts_to_try):
                     time.sleep(2)
@@ -1005,6 +1044,7 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
             range_name=f"C{sheet_row}:G{sheet_row}",
             values=[["FAILED", row.get("Task ID", ""), row.get("Created At", ""), row.get("Last Sent At", ""), last_mailbox_email]]
         )
+        write_run_log(run_log_ws, "ERROR", "SEND_FAILED", f"{recipient}: {type(last_exc).__name__}: {last_exc}")
         return
 
 
@@ -1012,11 +1052,14 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
 # IMAP REPLIES & DASHBOARD
 # =========================================================
 
-def classify_reply(subject, body):
+def classify_reply(subject, body, from_address=""):
     text = f"{subject} {body}".lower()
+    sender = (from_address or "").lower()
+    if sender.startswith(("mailer-daemon@", "postmaster@")):
+        return "BOUNCE"
     if any(term in text for term in ["unsubscribe", "remove me", "do not contact", "stop emailing", "opt out"]):
         return "UNSUBSCRIBE"
-    if any(term in text for term in ["mailbox not found", "user unknown", "address rejected", "delivery failed", "undelivered mail"]):
+    if any(term in text for term in ["mailbox not found", "user unknown", "address rejected", "delivery failed", "undelivered mail", "delivery status notification"]):
         return "BOUNCE"
     return "REPLY"
 
@@ -1036,18 +1079,42 @@ def extract_body(message):
     return "\n".join(parts).strip()
 
 
-def read_replies(mailboxes, replies_ws, suppression_ws, websites_ws):
+def extract_bounced_recipients(message, body, known_recipients):
+    """A bounce comes from mailer-daemon, not from the person we emailed.
+    Find which of OUR recipients bounced (only addresses that exist in the
+    Websites sheet are accepted, so signature/support addresses are ignored)."""
+    candidates = set()
+    header = str(message.get("X-Failed-Recipients", ""))
+    for addr in EMAIL_FINDER.findall(header):
+        candidates.add(normalize_email(addr))
+    for addr in EMAIL_FINDER.findall(body or ""):
+        candidates.add(normalize_email(addr))
+    return {a for a in candidates if a in known_recipients}
+
+
+def read_replies(mailboxes, replies_ws, suppression_ws, websites_ws, run_log_ws=None):
     existing_ids = {str(row.get("Message ID", "")).strip() for row in get_rows(replies_ws) if row.get("Message ID")}
+
+    # Load Websites once (not once per incoming message).
+    website_rows = get_rows(websites_ws)
+    rows_by_email = {}
+    for idx, website_row in enumerate(website_rows, start=2):
+        em = normalize_email(website_row.get("Email", ""))
+        if em:
+            rows_by_email.setdefault(em, []).append(idx)
+    known_recipients = set(rows_by_email)
+    suppressed_now = get_suppressed_emails(suppression_ws)
+
     for mailbox in mailboxes:
         if not mailbox.get("imap_host"):
             continue
+        connection = None
         try:
             connection = imaplib.IMAP4_SSL(mailbox["imap_host"], int(mailbox.get("imap_port", 993)), ssl_context=ssl.create_default_context())
             connection.login(mailbox["email"], mailbox["password"])
             connection.select("INBOX")
             status, data = connection.search(None, "UNSEEN")
             if status != "OK":
-                connection.logout()
                 continue
             for number in data[0].split():
                 status, message_data = connection.fetch(number, "(RFC822)")
@@ -1061,20 +1128,35 @@ def read_replies(mailboxes, replies_ws, suppression_ws, websites_ws):
                 from_address = normalize_email(parseaddr(message.get("From", ""))[1])
                 subject = decode_text(message.get("Subject", ""))
                 body = extract_body(message)
-                classification = classify_reply(subject, body)
+                classification = classify_reply(subject, body, from_address)
                 snippet = body[:300].replace("\n", " ")
                 sheets_retry(replies_ws.append_row, [timestamp(), from_address, subject, message_id, classification, snippet])
                 if message_id:
                     existing_ids.add(message_id)
-                if classification in ("UNSUBSCRIBE", "BOUNCE"):
-                    add_to_suppression(suppression_ws, from_address, classification)
-                for index, website_row in enumerate(get_rows(websites_ws), start=2):
-                    if normalize_email(website_row.get("Email", "")) == from_address:
-                        sheets_retry(websites_ws.update_cell, index, 8, classification)
+
+                if classification == "BOUNCE":
+                    targets = extract_bounced_recipients(message, body, known_recipients)
+                else:
+                    targets = {from_address} if from_address else set()
+
+                for target in targets:
+                    if classification in ("UNSUBSCRIBE", "BOUNCE") and target not in suppressed_now:
+                        add_to_suppression(suppression_ws, target, classification)
+                        suppressed_now.add(target)
+                    for sheet_row in rows_by_email.get(target, []):
+                        sheets_retry(websites_ws.update_cell, sheet_row, 8, classification)
+
                 connection.store(number, "+FLAGS", "\\Seen")
-            connection.logout()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.exception("Reading replies failed for %s", mailbox.get("email"))
+            if run_log_ws:
+                write_run_log(run_log_ws, "ERROR", "IMAP_FAILED", f"{mailbox.get('email')}: {type(exc).__name__}: {exc}")
+        finally:
+            if connection is not None:
+                try:
+                    connection.logout()
+                except Exception:
+                    pass
 
 
 def update_dashboard(dashboard_ws, history_ws, websites_ws, mailboxes):
@@ -1128,9 +1210,21 @@ def main():
     repair_stuck_sending_rows(websites_ws, history_ws, run_log_ws)
     archive_old_logs(spreadsheet, history_ws, run_log_ws, retention_days=30)
     discover_new_tasks(websites_ws, run_log_ws)
-    read_replies(mailboxes, replies_ws, suppression_ws, websites_ws)
+    read_replies(mailboxes, replies_ws, suppression_ws, websites_ws, run_log_ws)
 
-    process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws, suppression_ws, run_log_ws)
+    can_send = True
+    if not HAMZA_SIGNATURE:
+        write_run_log(run_log_ws, "ERROR", "SIGNATURE_MISSING", "HAMZA_SIGNATURE is empty. Sending skipped.")
+        can_send = False
+    elif len(mailboxes) > 1 and not ARSLAN_SIGNATURE:
+        write_run_log(run_log_ws, "WARNING", "ARSLAN_SIGNATURE_MISSING", "2nd mailbox will use HAMZA_SIGNATURE.")
+
+    if can_send and not within_send_window():
+        write_run_log(run_log_ws, "INFO", "OUTSIDE_SEND_WINDOW", f"Eastern hour={now_local().hour}. Sending skipped.")
+        can_send = False
+
+    if can_send:
+        process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws, suppression_ws, run_log_ws)
 
     update_dashboard(dashboard_ws, history_ws, websites_ws, mailboxes)
     logger.info("Email automation finished.")
