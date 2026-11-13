@@ -222,23 +222,42 @@ def _column_letter(number):
     return letters
 
 
-def _norm_intent(value):
+def _clean_label(value):
+    """Plain upper-case label (used for what the AI returns)."""
     return re.sub(r"[\s\-]+", "_", str(value or "").strip().upper())
+
+
+def _norm_intent(value):
+    """Forgiving reading of the Intent column in the Reply Templates sheet.
+    price / prices / fee / rate ...  -> PRICE_QUOTED
+    budget ...                       -> BUDGET_ASKED
+    any / all / price+budget / empty -> ANY"""
+    text = _clean_label(value)
+    tokens = set(text.split("_"))
+    has_price = bool(tokens & {"PRICE", "PRICES", "PRICING", "FEE", "FEES", "RATE", "RATES", "COST", "COSTS", "QUOTED"})
+    has_budget = bool(tokens & {"BUDGET", "BUDGETS"})
+    if tokens & {"ANY", "ALL"} or (has_price and has_budget):
+        return INTENT_ANY
+    if has_budget:
+        return INTENT_BUDGET
+    if has_price:
+        return INTENT_PRICE
+    return text
 
 
 def load_reply_templates(reply_templates_ws, core):
     """Active rows of the 'Reply Templates' sheet.
     Columns: Template ID | Intent | Subject | Body | Active
-    Intent is PRICE_QUOTED, BUDGET_ASKED or ANY."""
+    Only Body is required. Empty Intent means ANY. Subject is optional."""
     templates = []
     for row in core.get_rows(reply_templates_ws):
         if str(row.get("Active", "")).strip().lower() not in ("true", "yes", "1", "active"):
             continue
-        template_id = str(row.get("Template ID", "")).strip()
-        intent = _norm_intent(row.get("Intent", ""))
+        template_id = str(row.get("Template ID", "")).strip() or "REPLY"
+        intent = _norm_intent(row.get("Intent", "")) or INTENT_ANY
         subject = str(row.get("Subject", "")).strip()
         body = str(row.get("Body", "")).strip()
-        if template_id and intent and subject and body:
+        if body:
             templates.append({"id": template_id, "intent": intent, "subject": subject, "body": body})
     return templates
 
@@ -271,7 +290,7 @@ def classify_price_intent(core, reply_text):
     data = core.ai_generate_json(prompt, "reply_intent")
     if not isinstance(data, dict):
         return INTENT_OTHER
-    intent = _norm_intent(data.get("intent", ""))
+    intent = _clean_label(data.get("intent", ""))
     return intent if intent in VALID_INTENTS else INTENT_OTHER
 
 
@@ -290,7 +309,7 @@ def _latest_reply_for(replies_rows, recipient):
 def _reply_subject(their_subject, template_subject):
     subject = re.sub(r"\s+", " ", their_subject or "").strip()
     if not subject:
-        return template_subject
+        return template_subject or "Re: your message"
     return subject if re.match(r"(?i)^re\s*:", subject) else f"Re: {subject}"
 
 
@@ -346,7 +365,7 @@ def send_auto_replies(mailboxes, websites_ws, replies_ws, reply_templates_ws, hi
     if not templates:
         core.write_run_log(
             run_log_ws, "WARNING", "AUTO_REPLY_TEMPLATE_MISSING",
-            f"No active row in the 'Reply Templates' sheet. Waiting replies: {len(pending)}"
+            f"No active row with a Body in the 'Reply Templates' sheet. Waiting replies: {len(pending)}"
         )
         return 0
 
