@@ -41,6 +41,7 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           MAILBOXES_JSON: ${{ secrets.MAILBOXES_JSON }}
           HAMZA_SIGNATURE: ${{ secrets.HAMZA_SIGNATURE }}
+          ARSLAN_SIGNATURE: ${{ secrets.ARSLAN_SIGNATURE }}
 
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
