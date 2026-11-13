@@ -4,6 +4,7 @@ import json
 import time
 import ssl
 import smtplib
+import imaplib
 import sys
 import hashlib
 import logging
@@ -91,6 +92,7 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+_ACTIVE_RUN_LOG_WS = None
 
 _GEMINI_DISCOVERED_MODEL = None
 _OLLAMA_DISCOVERED = None
@@ -588,7 +590,12 @@ def load_mailboxes():
             raise ValueError(f"Invalid mailbox email: {mailbox['email']}")
         mailbox.setdefault("name", mailbox["email"])
         mailbox.setdefault("smtp_port", 587)
-        mailbox.setdefault("imap_host", mailbox["smtp_host"])
+        if not mailbox.get("imap_host"):
+            smtp_host_lower = str(mailbox["smtp_host"]).strip().lower()
+            if smtp_host_lower == "smtp.hostinger.com":
+                mailbox["imap_host"] = "imap.hostinger.com"
+            else:
+                mailbox["imap_host"] = mailbox["smtp_host"]
         mailbox.setdefault("imap_port", 993)
         active_mailboxes.append(mailbox)
     if not active_mailboxes:
@@ -935,6 +942,93 @@ def html_signature_to_text(signature_html):
     return re.sub(r"\n[ \t]*\n[ \t]*\n+", "\n\n", html.unescape(text)).strip()
 
 
+def _sent_folder_candidates(connection):
+    """Return likely Sent folders, preferring the IMAP folder marked \\Sent."""
+    status, folders = connection.list()
+    if status != "OK" or not folders:
+        raise RuntimeError("Could not list IMAP folders to locate the Sent folder.")
+
+    flagged = []
+    named = []
+    for raw_line in folders:
+        if not raw_line:
+            continue
+        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+
+        # LIST responses normally end with a quoted mailbox name.
+        match = re.search(r'"((?:[^"\\\\]|\\\\.)*)"\s*$', line)
+        if match:
+            folder = match.group(1).replace(r'\\"', '"').replace(r"\\\\", "\\")
+        else:
+            # Fallback for servers that return an unquoted mailbox name.
+            parts = line.rsplit(" ", 1)
+            folder = parts[-1].strip().strip('"') if parts else ""
+
+        if not folder or folder.upper() == "NIL":
+            continue
+
+        if re.search(r'\\Sent\b', line, flags=re.IGNORECASE):
+            flagged.append(folder)
+        if "sent" in folder.lower():
+            named.append(folder)
+
+    candidates = []
+    for folder in flagged + named + [
+        "Sent", "INBOX.Sent", "Sent Items", "INBOX.Sent Items",
+        "Sent Messages", "INBOX.Sent Messages"
+    ]:
+        if folder and folder not in candidates:
+            candidates.append(folder)
+    return candidates
+
+
+def save_sent_copy_to_imap(mailbox, message):
+    """Save a copy in the mailbox's IMAP Sent folder after SMTP accepts it."""
+    imap_host = mailbox.get("imap_host")
+    if not imap_host:
+        smtp_host = str(mailbox.get("smtp_host", "")).strip().lower()
+        imap_host = "imap.hostinger.com" if smtp_host == "smtp.hostinger.com" else smtp_host
+
+    imap_port = int(mailbox.get("imap_port", 993))
+    connection = None
+    try:
+        connection = imaplib.IMAP4_SSL(
+            imap_host,
+            imap_port,
+            ssl_context=ssl.create_default_context(),
+        )
+        connection.login(mailbox["email"], mailbox["password"])
+
+        candidates = _sent_folder_candidates(connection)
+        raw_message = message.as_bytes()
+        errors = []
+
+        for folder in candidates:
+            try:
+                status, response = connection.append(
+                    folder,
+                    r"(\Seen)",
+                    imaplib.Time2Internaldate(time.time()),
+                    raw_message,
+                )
+                if status == "OK":
+                    return folder
+                errors.append(f"{folder}: {status} {response}")
+            except Exception as exc:
+                errors.append(f"{folder}: {type(exc).__name__}: {exc}")
+
+        raise RuntimeError(
+            "Could not append the sent message to any detected Sent folder. "
+            + " | ".join(errors[:6])
+        )
+    finally:
+        if connection is not None:
+            try:
+                connection.logout()
+            except Exception:
+                pass
+
+
 def send_email(mailbox, recipient, subject, body, mailboxes, in_reply_to=None, references=None):
     signature_html = get_signature_html(mailbox, mailboxes)
     clean_body = remove_body_signoff(body)
@@ -980,8 +1074,35 @@ def send_email(mailbox, recipient, subject, body, mailboxes, in_reply_to=None, r
             server.ehlo()
             server.login(mailbox["email"], mailbox["password"])
             server.send_message(message)
-    return message["Message-ID"]
 
+    # SMTP has already accepted the email. A Sent-folder copy failure must NOT
+    # turn this into a send failure, otherwise the automation may send duplicates.
+    try:
+        sent_folder = save_sent_copy_to_imap(mailbox, message)
+        logger.info(
+            "SENT_COPY_SAVED | mailbox=%s | folder=%s | message_id=%s",
+            mailbox["email"], sent_folder, message["Message-ID"],
+        )
+        if _ACTIVE_RUN_LOG_WS is not None:
+            write_run_log(
+                _ACTIVE_RUN_LOG_WS, "INFO", "SENT_COPY_SAVED",
+                f"{mailbox['email']} | folder={sent_folder} | Message-ID={message['Message-ID']}",
+            )
+    except Exception as exc:
+        logger.exception(
+            "SENT_COPY_SAVE_FAILED | SMTP accepted email to %s via %s; "
+            "message was sent but could not be copied to IMAP Sent. "
+            "Reason: %s: %s",
+            recipient, mailbox["email"], type(exc).__name__, exc,
+        )
+        if _ACTIVE_RUN_LOG_WS is not None:
+            write_run_log(
+                _ACTIVE_RUN_LOG_WS, "WARNING", "SENT_COPY_SAVE_FAILED",
+                f"SMTP accepted email to {recipient} via {mailbox['email']}, "
+                f"but IMAP Sent copy failed: {type(exc).__name__}: {exc}",
+            )
+
+    return message["Message-ID"]
 
 def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws, suppression_ws, run_log_ws):
     history_rows = get_rows(history_ws)
@@ -1131,6 +1252,8 @@ def main():
     dashboard_ws = get_worksheet(spreadsheet, "Dashboard")
     suppression_ws = get_worksheet(spreadsheet, "Suppression")
     run_log_ws = get_worksheet(spreadsheet, "Run Log")
+    global _ACTIVE_RUN_LOG_WS
+    _ACTIVE_RUN_LOG_WS = run_log_ws
 
     write_run_log(run_log_ws, "INFO", "RUN_STARTED", f"Spreadsheet: {spreadsheet.title}")
     mailboxes = load_mailboxes()
