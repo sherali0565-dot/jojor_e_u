@@ -250,7 +250,9 @@ def pending_task_count(rows):
 
 
 def within_send_window():
-    if os.getenv("IGNORE_SEND_WINDOW", "").strip().lower() in ("1", "true", "yes"):
+    # Default: always allowed (like the old behaviour).
+    # Only enforce the time window if ENFORCE_SEND_WINDOW=1 is set.
+    if os.getenv("ENFORCE_SEND_WINDOW", "").strip().lower() not in ("1", "true", "yes"):
         return True
     hour = now_local().hour
     if hour < SEND_START_HOUR or hour >= SEND_END_HOUR:
