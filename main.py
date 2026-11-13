@@ -75,9 +75,11 @@ SEND_END_HOUR = 16
 PAUSE_START_HOUR = 13
 PAUSE_END_HOUR = 14
 
-# Auto-reply ("best price"), sent once to a contact who replied.
-# Uses the Templates-sheet row whose Template ID equals AUTO_REPLY_TEMPLATE_ID
-# (it must be Active=TRUE; it is never used for cold outreach).
+# Auto-reply (price / budget), sent once to a contact who replied.
+# The AI reads the vendor's reply and the matching template is taken from the
+# "Reply Templates" sheet (see replies.py).
+# AUTO_REPLY_TEMPLATE_ID is only used to keep an old "BEST_PRICE" row of the
+# Templates sheet out of cold outreach.
 # Set env AUTO_REPLY_ENABLED=0 to switch the feature off completely.
 AUTO_REPLY_ENABLED = os.getenv("AUTO_REPLY_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 AUTO_REPLY_TEMPLATE_ID = os.getenv("AUTO_REPLY_TEMPLATE_ID", "BEST_PRICE").strip() or "BEST_PRICE"
@@ -119,6 +121,9 @@ HEADERS = {
     "Replies": [
         "Received At", "From", "Subject",
         "Message ID", "Classification", "Snippet"
+    ],
+    "Reply Templates": [
+        "Template ID", "Intent", "Subject", "Body", "Active"
     ],
     "Dashboard": [
         "Metric", "Value"
@@ -1123,6 +1128,7 @@ def main():
     templates_ws = get_worksheet(spreadsheet, "Templates")
     history_ws = get_worksheet(spreadsheet, "History")
     replies_ws = get_worksheet(spreadsheet, "Replies")
+    reply_templates_ws = get_worksheet(spreadsheet, "Reply Templates")
     dashboard_ws = get_worksheet(spreadsheet, "Dashboard")
     suppression_ws = get_worksheet(spreadsheet, "Suppression")
     run_log_ws = get_worksheet(spreadsheet, "Run Log")
@@ -1136,7 +1142,7 @@ def main():
     core = sys.modules[__name__]  # replies.py uses main's helpers through this
     read_replies(mailboxes, replies_ws, suppression_ws, websites_ws, run_log_ws, core)
     try:
-        send_auto_replies(mailboxes, websites_ws, replies_ws, templates_ws, history_ws, suppression_ws, run_log_ws, core)
+        send_auto_replies(mailboxes, websites_ws, replies_ws, reply_templates_ws, history_ws, suppression_ws, run_log_ws, core)
     except Exception as exc:
         logger.exception("Auto-reply step failed.")
         write_run_log(run_log_ws, "ERROR", "AUTO_REPLY_STEP_FAILED", repr(exc))
