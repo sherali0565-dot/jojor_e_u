@@ -30,6 +30,7 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv(
 MAILBOXES_JSON = os.getenv("MAILBOXES_JSON", "").strip()
 HAMZA_SIGNATURE = os.getenv("HAMZA_SIGNATURE", "").strip()
 ARSLAN_SIGNATURE = os.getenv("ARSLAN_SIGNATURE", "").strip()
+JAMES_SIGNATURE = os.getenv("JAMES_SIGNATURE", "").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -585,7 +586,8 @@ def load_mailboxes():
 
 
 def get_mailbox_daily_limit(mailbox, history_rows):
-    max_limit = int(mailbox.get("daily_limit", DAILY_LIMIT_PER_MAILBOX))
+    # Hard cap each active mailbox at 10 sent emails per day.
+    max_limit = min(int(mailbox.get("daily_limit", DAILY_LIMIT_PER_MAILBOX)), DAILY_LIMIT_PER_MAILBOX)
     mb_email = normalize_email(mailbox["email"])
     first_date = None
     created_at_str = str(mailbox.get("created_at", "")).strip()
@@ -1112,24 +1114,34 @@ def _parse_signature(sig_str):
 
 
 def get_signature_html(mailbox, mailboxes):
-    # 1st mailbox -> HAMZA_SIGNATURE, 2nd mailbox -> ARSLAN_SIGNATURE,
-    # any other mailbox -> HAMZA_SIGNATURE. If ARSLAN_SIGNATURE is empty,
-    # the 2nd mailbox falls back to HAMZA_SIGNATURE.
+    # Mailbox rotation order: 1st -> HAMZA, 2nd -> ARSLAN, 3rd -> JAMES.
     mb_email = normalize_email(mailbox.get("email"))
-    index = 0
-    for i, m in enumerate(mailboxes):
-        if normalize_email(m.get("email")) == mb_email:
-            index = i
-            break
+    index = next(
+        (i for i, item in enumerate(mailboxes)
+         if normalize_email(item.get("email")) == mb_email),
+        -1,
+    )
 
-    sig_str = ARSLAN_SIGNATURE if index == 1 and ARSLAN_SIGNATURE else HAMZA_SIGNATURE
-    signature = _parse_signature(sig_str)
-
-    if not signature:
-        # Never send an email without a signature.
+    if index == 0:
+        sig_str = HAMZA_SIGNATURE
+    elif index == 1:
+        # Preserve the existing fallback for the second mailbox.
+        sig_str = ARSLAN_SIGNATURE or HAMZA_SIGNATURE
+    elif index == 2:
+        sig_str = JAMES_SIGNATURE
+    else:
         raise RuntimeError(
-            "Signature is empty (check HAMZA_SIGNATURE / ARSLAN_SIGNATURE). "
-            "Email was not sent."
+            f"No signature mapping exists for mailbox position {index + 1}. "
+            "Configure the first three mailboxes only."
+        )
+
+    signature = _parse_signature(sig_str)
+    if not signature:
+        secret_name = ("HAMZA_SIGNATURE" if index == 0 else
+                       "ARSLAN_SIGNATURE" if index == 1 and ARSLAN_SIGNATURE else
+                       "HAMZA_SIGNATURE" if index == 1 else "JAMES_SIGNATURE")
+        raise RuntimeError(
+            f"Signature is empty (check GitHub Secret {secret_name}). Email was not sent."
         )
     return signature
 
@@ -1470,8 +1482,14 @@ def main():
     if not HAMZA_SIGNATURE:
         write_run_log(run_log_ws, "ERROR", "SIGNATURE_MISSING", "HAMZA_SIGNATURE is empty. Sending skipped.")
         can_send = False
-    elif len(mailboxes) > 1 and not ARSLAN_SIGNATURE:
+    if len(mailboxes) > 1 and not ARSLAN_SIGNATURE:
         write_run_log(run_log_ws, "WARNING", "ARSLAN_SIGNATURE_MISSING", "2nd mailbox will use HAMZA_SIGNATURE.")
+    if len(mailboxes) > 2 and not JAMES_SIGNATURE:
+        write_run_log(run_log_ws, "ERROR", "SIGNATURE_MISSING", "JAMES_SIGNATURE is empty. Sending skipped for the third mailbox configuration.")
+        can_send = False
+    if len(mailboxes) > 3:
+        write_run_log(run_log_ws, "ERROR", "UNSUPPORTED_MAILBOX_COUNT", "This signature mapping supports a maximum of three mailboxes.")
+        can_send = False
 
     if can_send and not within_send_window():
         write_run_log(run_log_ws, "INFO", "OUTSIDE_SEND_WINDOW", f"Eastern hour={now_local().hour}. Sending skipped.")
