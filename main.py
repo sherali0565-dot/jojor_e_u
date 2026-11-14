@@ -28,9 +28,10 @@ GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv(
     "GOOGLE_SERVICE_ACCOUNT_JSON", ""
 ).strip()
 MAILBOXES_JSON = os.getenv("MAILBOXES_JSON", "").strip()
-HAMZA_SIGNATURE = os.getenv("HAMZA_SIGNATURE", "").strip()
-ARSLAN_SIGNATURE = os.getenv("ARSLAN_SIGNATURE", "").strip()
-JAMES_SIGNATURE = os.getenv("JAMES_SIGNATURE", "").strip()
+# Signature secrets are raw HTML. Do not strip or rewrite their contents.
+HAMZA_SIGNATURE = os.getenv("HAMZA_SIGNATURE", "")
+ARSLAN_SIGNATURE = os.getenv("ARSLAN_SIGNATURE", "")
+JAMES_SIGNATURE = os.getenv("JAMES_SIGNATURE", "")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -582,6 +583,18 @@ def load_mailboxes():
         active_mailboxes.append(mailbox)
     if not active_mailboxes:
         raise RuntimeError("No active mailboxes configured.")
+
+    # Keep rotation deterministic even if MAILBOXES_JSON is reordered.
+    canonical_order = {
+        "hamza.khan@westernarsal.com": 0,
+        "arslan.lodhi@westernarsal.com": 1,
+        "james.williams@westernarsal.com": 2,
+    }
+    active_mailboxes.sort(
+        key=lambda item: canonical_order.get(normalize_email(item["email"]), 99)
+    )
+    if len(active_mailboxes) > 3:
+        raise RuntimeError("This setup supports exactly these three mailboxes at most.")
     return active_mailboxes
 
 
@@ -662,16 +675,29 @@ def get_ordered_candidate_mailboxes(mailboxes, history_rows):
     return mailboxes[start_idx:] + mailboxes[:start_idx]
 
 
-def daily_sent_count(history_rows, mailbox_email):
+def daily_sent_count(history_rows, mailbox_email, website_rows=None):
+    """Count confirmed and uncertain sends conservatively against the daily cap."""
     today = now_local().date().isoformat()
     mb_email = normalize_email(mailbox_email)
-    return sum(
-        1 for row in history_rows
-        if str(row.get("Date", "")).strip() == today
-        and normalize_email(row.get("Mailbox", "")) == mb_email
-        and str(row.get("Status", "")).strip().upper() == "SENT"
-    )
-
+    counted_recipients = set()
+    for row in history_rows:
+        if (
+            str(row.get("Date", "")).strip() == today
+            and normalize_email(row.get("Mailbox", "")) == mb_email
+            and str(row.get("Status", "")).strip().upper() in ("SENT", "SEND_REVIEW")
+        ):
+            address = normalize_email(row.get("Email", ""))
+            counted_recipients.add(address or f"history-row-{len(counted_recipients)}")
+    for row in website_rows or []:
+        if (
+            str(row.get("Status", "")).strip().upper() == "SENT"
+            and normalize_email(row.get("Mailbox", "")) == mb_email
+            and normalize_email(row.get("Last Sent At", ""))[:10] == today
+        ):
+            address = normalize_email(row.get("Email", ""))
+            if address:
+                counted_recipients.add(address)
+    return len(counted_recipients)
 
 
 
@@ -765,23 +791,54 @@ def extract_body(message):
 
 
 def extract_bounced_recipients(message, body, known_recipients):
-    """Only accept bounce addresses that exist in the Websites sheet."""
+    """Extract only structured failed-recipient fields from a DSN message."""
     candidates = set()
-    header = str(message.get("X-Failed-Recipients", ""))
-    for address in EMAIL_FINDER.findall(header):
-        candidates.add(normalize_email(address))
-    for address in EMAIL_FINDER.findall(body or ""):
-        candidates.add(normalize_email(address))
-    return {address for address in candidates if address in known_recipients}
+
+    def add_addresses(value):
+        for address in EMAIL_FINDER.findall(str(value or "")):
+            normalized = normalize_email(address)
+            if normalized in known_recipients:
+                candidates.add(normalized)
+
+    add_addresses(message.get("X-Failed-Recipients", ""))
+    add_addresses(message.get("Final-Recipient", ""))
+    add_addresses(message.get("Original-Recipient", ""))
+    # Some providers flatten DSN fields into plain-text body lines. Accept only
+    # explicit Final-Recipient / Original-Recipient fields, never arbitrary addresses.
+    for match in re.findall(
+        r"(?im)^\s*(?:Final|Original)-Recipient\s*:\s*(?:rfc822\s*;\s*)?([^\s<>;,]+@[^\s<>;,]+)",
+        body or "",
+    ):
+        add_addresses(match)
+
+    if message.is_multipart():
+        for part in message.walk():
+            if part.get_content_type() == "message/delivery-status":
+                payload = part.get_payload()
+                blocks = payload if isinstance(payload, list) else [payload]
+                for block in blocks:
+                    if not hasattr(block, "get"):
+                        continue
+                    add_addresses(block.get("Final-Recipient", ""))
+                    add_addresses(block.get("Original-Recipient", ""))
+
+    return candidates
 
 
-def read_replies(mailboxes, replies_ws, suppression_ws, websites_ws, run_log_ws):
-    """Read unseen incoming mail, classify it, and update reply/suppression status.
+def _message_id_tokens(value):
+    """Extract normalized RFC Message-ID tokens from In-Reply-To/References."""
+    if not value:
+        return set()
+    found = re.findall(r"<[^<>]+>", str(value))
+    if not found:
+        found = [part for part in str(value).split() if "@" in part]
+    return {item.strip().lower() for item in found if item.strip()}
 
-    This function only detects and records incoming replies. It never sends email.
-    """
+
+def read_replies(mailboxes, replies_ws, suppression_ws, websites_ws, history_ws, archive_ws, run_log_ws):
+    """Record incoming mail; only mark REPLY when it matches an outbound thread."""
     existing_ids = {
-        str(row.get("Message ID", "")).strip()
+        str(row.get("Message ID", "")).strip().lower()
         for row in get_rows(replies_ws)
         if row.get("Message ID")
     }
@@ -793,22 +850,30 @@ def read_replies(mailboxes, replies_ws, suppression_ws, websites_ws, run_log_ws)
         address = normalize_email(website_row.get("Email", ""))
         if address:
             rows_by_email.setdefault(address, []).append(idx)
-        status_by_row[idx] = str(
-            website_row.get("Reply Status", "")
-        ).strip().upper()
+        status_by_row[idx] = str(website_row.get("Reply Status", "")).strip().upper()
 
     known_recipients = set(rows_by_email)
     suppressed_now = get_suppressed_emails(suppression_ws)
 
+    # Only successful outbound sends can establish a reply thread.
+    sent_message_to_recipient = {}
+    outbound_history = get_rows(history_ws) + (get_rows(archive_ws) if archive_ws is not None else [])
+    for history_row in outbound_history:
+        if str(history_row.get("Status", "")).strip().upper() != "SENT":
+            continue
+        recipient = normalize_email(history_row.get("Email", ""))
+        if recipient not in known_recipients:
+            continue
+        for token in _message_id_tokens(history_row.get("Message ID", "")):
+            sent_message_to_recipient[token] = recipient
+
     for mailbox in mailboxes:
         if not mailbox.get("imap_host"):
             continue
-
         connection = None
         try:
             connection = imaplib.IMAP4_SSL(
-                mailbox["imap_host"],
-                int(mailbox.get("imap_port", 993)),
+                mailbox["imap_host"], int(mailbox.get("imap_port", 993)),
                 ssl_context=ssl.create_default_context()
             )
             connection.login(mailbox["email"], mailbox["password"])
@@ -819,75 +884,83 @@ def read_replies(mailboxes, replies_ws, suppression_ws, websites_ws, run_log_ws)
 
             for number in data[0].split():
                 status, message_data = connection.fetch(number, "(RFC822)")
-                if status != "OK":
+                if status != "OK" or not message_data or not isinstance(message_data[0], tuple):
                     continue
 
                 message = email.message_from_bytes(message_data[0][1])
                 message_id = str(message.get("Message-ID", "")).strip()
-                if message_id and message_id in existing_ids:
-                    connection.store(number, "+FLAGS", "\\Seen")
-                    continue
-
-                from_address = normalize_email(
-                    parseaddr(message.get("From", ""))[1]
-                )
+                message_id_key = message_id.lower()
+                from_address = normalize_email(parseaddr(message.get("From", ""))[1])
                 subject = decode_text(message.get("Subject", ""))
                 body = extract_body(message)
-                classification = classify_reply(
+                initial_classification = classify_reply(
                     subject, body, from_address, is_auto_responder(message)
                 )
                 snippet = body[:1200].replace("\n", " ")
 
-                sheets_retry(
-                    replies_ws.append_row,
-                    [
-                        timestamp(), from_address, subject,
-                        message_id, classification, snippet
-                    ]
+                reference_ids = (
+                    _message_id_tokens(message.get("In-Reply-To", ""))
+                    | _message_id_tokens(message.get("References", ""))
                 )
-                if message_id:
-                    existing_ids.add(message_id)
+                matched_recipients = {
+                    sent_message_to_recipient[token]
+                    for token in reference_ids
+                    if token in sent_message_to_recipient
+                }
 
-                if classification == "BOUNCE":
-                    targets = extract_bounced_recipients(
-                        message, body, known_recipients
-                    )
+                if initial_classification == "BOUNCE":
+                    classification = "BOUNCE"
+                    targets = extract_bounced_recipients(message, body, known_recipients)
+                elif initial_classification == "UNSUBSCRIBE":
+                    # Honor opt-outs even if the sender uses an alternate address in a known thread.
+                    classification = "UNSUBSCRIBE"
+                    targets = matched_recipients or ({from_address} if from_address in known_recipients else set())
+                elif initial_classification == "AUTOREPLY" and matched_recipients:
+                    classification = "AUTOREPLY"
+                    targets = matched_recipients
+                elif initial_classification == "AUTOREPLY" and from_address in known_recipients:
+                    classification = "AUTOREPLY"
+                    targets = {from_address}
+                elif matched_recipients:
+                    # Thread headers are stronger evidence than the visible From address;
+                    # contacts sometimes reply from an alias or a shared mailbox.
+                    classification = initial_classification
+                    targets = matched_recipients
                 else:
-                    targets = {from_address} if from_address else set()
+                    # Do not treat unrelated/old mail from a contact as a reply.
+                    classification = "UNMATCHED"
+                    targets = set()
+
+                if not message_id_key or message_id_key not in existing_ids:
+                    sheets_retry(
+                        replies_ws.append_row,
+                        [timestamp(), from_address, subject, message_id, classification, snippet]
+                    )
+                    if message_id_key:
+                        existing_ids.add(message_id_key)
 
                 for target in targets:
-                    if (
-                        classification in ("UNSUBSCRIBE", "BOUNCE")
-                        and target not in suppressed_now
-                    ):
-                        add_to_suppression(
-                            suppression_ws, target, classification
-                        )
+                    if classification in ("UNSUBSCRIBE", "BOUNCE") and target not in suppressed_now:
+                        add_to_suppression(suppression_ws, target, classification)
                         suppressed_now.add(target)
-
                     for sheet_row in rows_by_email.get(target, []):
                         current = status_by_row.get(sheet_row, "")
-                        if (
-                            _REPLY_STATUS_PRIORITY.get(classification, 0)
-                            >= _REPLY_STATUS_PRIORITY.get(current, 0)
-                        ):
-                            sheets_retry(
-                                websites_ws.update_cell,
-                                sheet_row, 8, classification
-                            )
+                        if _REPLY_STATUS_PRIORITY.get(classification, 0) >= _REPLY_STATUS_PRIORITY.get(current, 0):
+                            sheets_retry(websites_ws.update_cell, sheet_row, 8, classification)
                             status_by_row[sheet_row] = classification
 
                 connection.store(number, "+FLAGS", "\\Seen")
+                if classification == "UNMATCHED" and run_log_ws:
+                    write_run_log(
+                        run_log_ws, "INFO", "INCOMING_UNMATCHED",
+                        f"Mailbox={mailbox['email']} | From={from_address} | Message-ID={message_id or 'missing'}"
+                    )
 
         except Exception as exc:
-            logger.exception(
-                "Reading replies failed for %s", mailbox.get("email")
-            )
+            logger.exception("Reading replies failed for %s", mailbox.get("email"))
             if run_log_ws:
                 write_run_log(
-                    run_log_ws,
-                    "ERROR",
-                    "IMAP_FAILED",
+                    run_log_ws, "ERROR", "IMAP_FAILED",
                     f"{mailbox.get('email')}: {type(exc).__name__}: {exc}"
                 )
         finally:
@@ -904,6 +977,7 @@ def read_replies(mailboxes, replies_ws, suppression_ws, websites_ws, run_log_ws)
 # =========================================================
 
 def repair_stuck_sending_rows(websites_ws, history_ws, run_log_ws):
+    """Resolve stale SENDING rows conservatively to prevent accidental duplicates."""
     values = sheets_retry(websites_ws.get_all_values)
     if not values or len(values) < 2:
         return 0
@@ -912,16 +986,14 @@ def repair_stuck_sending_rows(websites_ws, history_ws, run_log_ws):
     required = ("Email", "Status", "Task ID", "Created At", "Last Sent At", "Mailbox")
     if any(col not in h_map for col in required):
         return 0
-    history_rows = get_rows(history_ws)
-    sent_by_email = {}
-    for h in history_rows:
-        em = normalize_email(h.get("Email", ""))
-        st = str(h.get("Status", "")).strip().upper()
-        if em and st == "SENT":
-            sent_by_email[em] = {
-                "timestamp": str(h.get("Timestamp", "")).strip(),
-                "mailbox": normalize_email(h.get("Mailbox", ""))
-            }
+
+    # Use the latest History event per recipient, not any historical SENT event.
+    latest_by_email = {}
+    for history_row in get_rows(history_ws):
+        recipient = normalize_email(history_row.get("Email", ""))
+        if recipient:
+            latest_by_email[recipient] = history_row
+
     repaired = 0
     for sheet_row, row in enumerate(values[1:], start=2):
         def get_col(col):
@@ -929,23 +1001,26 @@ def repair_stuck_sending_rows(websites_ws, history_ws, run_log_ws):
             return str(row[idx]).strip() if idx < len(row) and row[idx] is not None else ""
         if get_col("Status").upper() != "SENDING":
             continue
+
         recipient = normalize_email(get_col("Email"))
-        if recipient in sent_by_email:
-            info = sent_by_email[recipient]
-            sheets_retry(
-                websites_ws.update,
-                range_name=f"C{sheet_row}:G{sheet_row}",
-                values=[["SENT", get_col("Task ID"), get_col("Created At"), info["timestamp"] or timestamp(), info["mailbox"] or get_col("Mailbox")]]
-            )
+        latest = latest_by_email.get(recipient, {})
+        latest_status = str(latest.get("Status", "")).strip().upper()
+        if latest_status == "SENT":
+            new_status = "SENT"
+            last_sent = str(latest.get("Timestamp", "")).strip() or timestamp()
+            mailbox = normalize_email(latest.get("Mailbox", "")) or get_col("Mailbox")
+            values_to_write = [new_status, get_col("Task ID"), get_col("Created At"), last_sent, mailbox]
         else:
-            sheets_retry(
-                websites_ws.update,
-                range_name=f"C{sheet_row}:G{sheet_row}",
-                values=[["PENDING", get_col("Task ID"), get_col("Created At"), get_col("Last Sent At"), ""]]
-            )
+            # No definitive SENT record: SMTP may have accepted before a crash.
+            # Hold for manual verification rather than automatically sending again.
+            values_to_write = ["SEND_REVIEW", get_col("Task ID"), get_col("Created At"), get_col("Last Sent At"), get_col("Mailbox")]
+            write_run_log(run_log_ws, "WARNING", "SEND_REVIEW_REQUIRED", f"Recipient={recipient} has a stale SENDING row without a definitive SENT history entry; verify mailbox delivery before resetting to PENDING.")
+
+        sheets_retry(websites_ws.update, range_name=f"C{sheet_row}:G{sheet_row}", values=[values_to_write])
         repaired += 1
+
     if repaired:
-        write_run_log(run_log_ws, "WARNING", "STUCK_SENDING_REPAIRED", f"Repaired rows={repaired}")
+        write_run_log(run_log_ws, "WARNING", "STUCK_SENDING_REPAIRED", f"Reviewed stale rows={repaired}")
     return repaired
 
 
@@ -1098,48 +1173,35 @@ def append_history(history_ws, recipient, website, mailbox, status, message_id="
 
 
 def _parse_signature(sig_str):
-    """Accepts raw HTML, a JSON string, or a JSON object with an 'html' key."""
-    sig_str = (sig_str or "").strip()
-    if not sig_str:
+    """Return the raw HTML secret unchanged; retain legacy JSON compatibility."""
+    if sig_str is None or not str(sig_str).strip():
         return ""
+    raw = str(sig_str)
     try:
-        parsed = json.loads(sig_str)
-        if isinstance(parsed, dict):
-            return str(parsed.get("html", "")).strip()
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and isinstance(parsed.get("html"), str):
+            return parsed["html"]
         if isinstance(parsed, str):
-            return parsed.strip()
+            return parsed
     except json.JSONDecodeError:
         pass
-    return sig_str
+    return raw
 
 
 def get_signature_html(mailbox, mailboxes):
-    # Mailbox rotation order: 1st -> HAMZA, 2nd -> ARSLAN, 3rd -> JAMES.
+    # Explicit mapping prevents a reordered MAILBOXES_JSON from assigning
+    # James's signature to another sender (or vice versa).
+    signature_by_email = {
+        "hamza.khan@westernarsal.com": (HAMZA_SIGNATURE, "HAMZA_SIGNATURE"),
+        "arslan.lodhi@westernarsal.com": (ARSLAN_SIGNATURE, "ARSLAN_SIGNATURE"),
+        "james.williams@westernarsal.com": (JAMES_SIGNATURE, "JAMES_SIGNATURE"),
+    }
     mb_email = normalize_email(mailbox.get("email"))
-    index = next(
-        (i for i, item in enumerate(mailboxes)
-         if normalize_email(item.get("email")) == mb_email),
-        -1,
-    )
-
-    if index == 0:
-        sig_str = HAMZA_SIGNATURE
-    elif index == 1:
-        # Preserve the existing fallback for the second mailbox.
-        sig_str = ARSLAN_SIGNATURE or HAMZA_SIGNATURE
-    elif index == 2:
-        sig_str = JAMES_SIGNATURE
-    else:
-        raise RuntimeError(
-            f"No signature mapping exists for mailbox position {index + 1}. "
-            "Configure the first three mailboxes only."
-        )
-
-    signature = _parse_signature(sig_str)
-    if not signature:
-        secret_name = ("HAMZA_SIGNATURE" if index == 0 else
-                       "ARSLAN_SIGNATURE" if index == 1 and ARSLAN_SIGNATURE else
-                       "HAMZA_SIGNATURE" if index == 1 else "JAMES_SIGNATURE")
+    if mb_email not in signature_by_email:
+        raise RuntimeError(f"No signature mapping configured for mailbox {mb_email}.")
+    raw_signature, secret_name = signature_by_email[mb_email]
+    signature = _parse_signature(raw_signature)
+    if not signature or not signature.strip():
         raise RuntimeError(
             f"Signature is empty (check GitHub Secret {secret_name}). Email was not sent."
         )
@@ -1249,80 +1311,113 @@ def save_sent_copy_to_imap(mailbox, message):
                 pass
 
 
+class SMTPDeliveryUncertain(RuntimeError):
+    """SMTP connection failed at a point where recipient acceptance is unknown."""
+
+
+def _send_message_with_uncertainty_guard(server, message):
+    try:
+        return server.send_message(message)
+    except (smtplib.SMTPRecipientsRefused, smtplib.SMTPDataError):
+        # The SMTP server explicitly rejected the recipient/message.
+        raise
+    except smtplib.SMTPResponseException as exc:
+        # An explicit 4xx/5xx response is a rejection, not an accepted send.
+        if getattr(exc, "smtp_code", 550) >= 400:
+            raise
+        raise SMTPDeliveryUncertain(str(exc)) from exc
+    except Exception as exc:
+        # A dropped connection/timeout after DATA can leave delivery ambiguous.
+        raise SMTPDeliveryUncertain(
+            f"SMTP outcome is uncertain ({type(exc).__name__}: {exc})"
+        ) from exc
+
+
 def send_email(mailbox, recipient, subject, body, mailboxes):
     signature_html = get_signature_html(mailbox, mailboxes)
     clean_body = remove_body_signoff(body)
-    signature_text = html_signature_to_text(signature_html)
-
     message = EmailMessage()
     message["From"] = formataddr((mailbox.get("name", "Western Arsal"), mailbox["email"]))
     message["To"] = recipient
     message["Subject"] = subject
     message["Message-ID"] = make_msgid()
 
-    plain_content = clean_body.rstrip()
-    if signature_text:
-        plain_content += "\n\n" + signature_text
-    message.set_content(plain_content)
+    # Keep the plain-text alternative limited to the authored body. The raw HTML
+    # signature secret is appended once, unchanged, in the HTML alternative below.
+    message.set_content(clean_body.rstrip())
 
     paragraphs = re.split(r"\n[ \t]*\n+", clean_body.replace("\r\n", "\n").strip()) if clean_body else []
-
     body_parts = []
-    for p in paragraphs:
-        escaped_p = html.escape(p).replace("\n", "<br>\n")
-        body_parts.append(f'<p style="margin:0 0 16px 0;">{escaped_p}</p>')
+    for paragraph in paragraphs:
+        escaped = html.escape(paragraph).replace("\n", "<br>\n")
+        body_parts.append(f'<p style="margin:0 0 16px 0;">{escaped}</p>')
     body_html = "".join(body_parts)
-
-    html_content = f"<!doctype html><html><body><div style=\"font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#333;\">{body_html}<div style=\"margin-top:24px;\">{signature_html}</div></div></body></html>"
+    html_content = (
+        '<!doctype html><html><body><div style="font-family:Arial,sans-serif;'
+        'font-size:14px;line-height:1.6;color:#333;">'
+        f'{body_html}<div style="margin-top:24px;">{signature_html}</div>'
+        '</div></body></html>'
+    )
     message.add_alternative(html_content, subtype="html")
 
     context = ssl.create_default_context()
     smtp_host, smtp_port = mailbox["smtp_host"], int(mailbox["smtp_port"])
-
-    if smtp_port == 465:
-        with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context, timeout=30) as server:
-            server.login(mailbox["email"], mailbox["password"])
-            server.send_message(message)
-    else:
-        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+    server = None
+    send_attempted = False
+    accepted = False
+    try:
+        # Connection, TLS and authentication failures happen before DATA and are safe to fail over.
+        if smtp_port == 465:
+            server = smtplib.SMTP_SSL(smtp_host, smtp_port, context=context, timeout=30)
+        else:
+            server = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
             server.ehlo()
             server.starttls(context=context)
             server.ehlo()
-            server.login(mailbox["email"], mailbox["password"])
-            server.send_message(message)
+        server.login(mailbox["email"], mailbox["password"])
 
-    # SMTP has already accepted the email. A Sent-folder copy failure must NOT
-    # turn this into a send failure, otherwise the automation may send duplicates.
+        send_attempted = True
+        _send_message_with_uncertainty_guard(server, message)
+        accepted = True
+    except SMTPDeliveryUncertain:
+        raise
+    except (smtplib.SMTPRecipientsRefused, smtplib.SMTPDataError, smtplib.SMTPResponseException):
+        # Explicit SMTP rejection: this server did not accept the message.
+        raise
+    except Exception as exc:
+        if send_attempted and not accepted:
+            raise SMTPDeliveryUncertain(
+                f"SMTP outcome uncertain ({type(exc).__name__}: {exc})"
+            ) from exc
+        raise
+    finally:
+        if server is not None:
+            try:
+                # Once send_message returned, QUIT/close failures must never trigger failover.
+                server.quit()
+            except Exception:
+                try:
+                    server.close()
+                except Exception:
+                    pass
+                if accepted:
+                    logger.warning("SMTP_QUIT_FAILED after accepted send; not retrying via another mailbox.")
+
+    # SMTP accepted the email. A Sent-folder copy failure is non-fatal.
     try:
         sent_folder = save_sent_copy_to_imap(mailbox, message)
-        logger.info(
-            "SENT_COPY_SAVED | mailbox=%s | folder=%s | message_id=%s",
-            mailbox["email"], sent_folder, message["Message-ID"],
-        )
+        logger.info("SENT_COPY_SAVED | mailbox=%s | folder=%s | message_id=%s", mailbox["email"], sent_folder, message["Message-ID"])
         if _ACTIVE_RUN_LOG_WS is not None:
-            write_run_log(
-                _ACTIVE_RUN_LOG_WS, "INFO", "SENT_COPY_SAVED",
-                f"{mailbox['email']} | folder={sent_folder} | Message-ID={message['Message-ID']}",
-            )
+            write_run_log(_ACTIVE_RUN_LOG_WS, "INFO", "SENT_COPY_SAVED", f"{mailbox['email']} | folder={sent_folder} | Message-ID={message['Message-ID']}")
     except Exception as exc:
-        logger.exception(
-            "SENT_COPY_SAVE_FAILED | SMTP accepted email to %s via %s; "
-            "message was sent but could not be copied to IMAP Sent. "
-            "Reason: %s: %s",
-            recipient, mailbox["email"], type(exc).__name__, exc,
-        )
+        logger.exception("SENT_COPY_SAVE_FAILED | SMTP accepted email to %s via %s: %s: %s", recipient, mailbox["email"], type(exc).__name__, exc)
         if _ACTIVE_RUN_LOG_WS is not None:
-            write_run_log(
-                _ACTIVE_RUN_LOG_WS, "WARNING", "SENT_COPY_SAVE_FAILED",
-                f"SMTP accepted email to {recipient} via {mailbox['email']}, "
-                f"but IMAP Sent copy failed: {type(exc).__name__}: {exc}",
-            )
+            write_run_log(_ACTIVE_RUN_LOG_WS, "WARNING", "SENT_COPY_SAVE_FAILED", f"SMTP accepted email to {recipient} via {mailbox['email']}, but IMAP Sent copy failed: {type(exc).__name__}: {exc}")
 
     return message["Message-ID"]
 
 def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws, suppression_ws, run_log_ws):
     history_rows = get_rows(history_ws)
-
     too_many_bounces, bounce_rate = is_bounce_rate_too_high(history_rows, suppression_ws)
     if too_many_bounces:
         write_run_log(run_log_ws, "WARNING", "BOUNCE_GUARD_STOP", f"Bounce rate {bounce_rate:.1%} (>15%)")
@@ -1334,15 +1429,20 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
 
     rows = get_rows(websites_ws)
     suppressed = get_suppressed_emails(suppression_ws)
-    contacted = get_contacted_emails(history_rows)
-
+    archive_rows = get_rows(get_worksheet(spreadsheet, "Archive"))
+    contacted = get_contacted_emails(history_rows + archive_rows)
     ordered_mailboxes = get_ordered_candidate_mailboxes(mailboxes, history_rows)
     eligible_mailboxes = [
-    mb for mb in ordered_mailboxes
-    if daily_sent_count(history_rows, mb["email"]) < get_mailbox_daily_limit(mb, history_rows)
-]
-
+        mb for mb in ordered_mailboxes
+        if daily_sent_count(history_rows, mb["email"], rows) < get_mailbox_daily_limit(mb, history_rows)
+        and is_mailbox_cooled_down(history_rows, mb["email"])[0]
+    ]
     if not eligible_mailboxes:
+        cooldowns = [
+            f"{mb['email']}={is_mailbox_cooled_down(history_rows, mb['email'])[1]} consecutive failures"
+            for mb in ordered_mailboxes if not is_mailbox_cooled_down(history_rows, mb['email'])[0]
+        ]
+        write_run_log(run_log_ws, "INFO", "NO_ELIGIBLE_MAILBOX", "All mailboxes are at their daily limit or in cooldown. " + "; ".join(cooldowns))
         return
 
     for index, row in enumerate(rows):
@@ -1350,7 +1450,6 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
         recipient = normalize_email(row.get("Email", ""))
         status = str(row.get("Status", "")).strip().upper()
         sheet_row = index + 2
-
         if status != "PENDING":
             continue
         if not website or not valid_email(recipient):
@@ -1359,7 +1458,11 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
         if recipient in suppressed:
             sheets_retry(websites_ws.update_cell, sheet_row, 3, "SUPPRESSED")
             continue
-        if recipient in contacted:
+        if recipient in contacted or any(
+            normalize_email(item.get("Email", "")) == recipient
+            and str(item.get("Status", "")).strip().upper() == "SENT"
+            for item in rows
+        ):
             sheets_retry(websites_ws.update_cell, sheet_row, 3, "ALREADY_CONTACTED")
             continue
 
@@ -1376,47 +1479,94 @@ def process_sends(spreadsheet, mailboxes, websites_ws, templates_ws, history_ws,
             write_run_log(run_log_ws, "WARNING", "NAME_UNSURE", f"Row {sheet_row}: {website} -> {name_info['name']}")
             continue
 
-        website_name = name_info["name"]
         template = ai_format_template(select_template(templates, index))
         template_id = template["id"]
+        subject = template["subject"].replace("{website_name}", name_info["name"])
+        body = template["body"].replace("{website_name}", name_info["name"])
 
-        subject = template["subject"].replace("{website_name}", website_name)
-        body = template["body"].replace("{website_name}", website_name)
+        history_rows = get_rows(history_ws)
+        eligible_mailboxes = [
+            mb for mb in get_ordered_candidate_mailboxes(mailboxes, history_rows)
+            if daily_sent_count(history_rows, mb["email"], rows) < get_mailbox_daily_limit(mb, history_rows)
+            and is_mailbox_cooled_down(history_rows, mb["email"])[0]
+        ]
+        if not eligible_mailboxes:
+            write_run_log(run_log_ws, "INFO", "NO_ELIGIBLE_MAILBOX", "All mailboxes are at their daily limit or in cooldown.")
+            return
 
-        attempts_to_try = eligible_mailboxes[:3]
-        last_exc, last_mailbox_email = None, ""
-
-        for attempt_num, mailbox in enumerate(attempts_to_try, start=1):
-            last_mailbox_email = mailbox["email"]
-            append_history(history_ws, recipient, website, mailbox["email"], "SENDING", details=f"Attempt {attempt_num}", template_id=template_id)
+        last_exc = None
+        sent_successfully = False
+        for attempt_num, mailbox in enumerate(eligible_mailboxes, start=1):
+            mailbox_email = normalize_email(mailbox["email"])
+            # Persist the pre-send marker before SMTP. If this fails, do not send.
+            append_history(history_ws, recipient, website, mailbox_email, "SENDING", details=f"Attempt {attempt_num}", template_id=template_id)
             sheets_retry(
                 websites_ws.update,
                 range_name=f"C{sheet_row}:G{sheet_row}",
-                values=[["SENDING", row.get("Task ID", ""), row.get("Created At", ""), "", mailbox["email"]]]
+                values=[["SENDING", row.get("Task ID", ""), row.get("Created At", ""), "", mailbox_email]]
             )
             try:
                 message_id = send_email(mailbox, recipient, subject, body, mailboxes)
-                append_history(history_ws, recipient, website, mailbox["email"], "SENT", message_id, "Success", template_id=template_id)
-                sheets_retry(
-                    websites_ws.update,
-                    range_name=f"C{sheet_row}:G{sheet_row}",
-                    values=[["SENT", row.get("Task ID", ""), row.get("Created At", ""), timestamp(), mailbox["email"]]]
-                )
+            except SMTPDeliveryUncertain as exc:
+                # Do not fail over: the previous SMTP server may already have accepted it.
+                logger.error("SMTP outcome uncertain via %s for %s: %s", mailbox_email, recipient, exc)
+                try:
+                    append_history(history_ws, recipient, website, mailbox_email, "SEND_REVIEW", details=f"SMTP outcome uncertain: {exc}", template_id=template_id)
+                except Exception:
+                    logger.exception("Could not write SEND_REVIEW history for %s", recipient)
+                try:
+                    sheets_retry(websites_ws.update, range_name=f"C{sheet_row}:G{sheet_row}", values=[["SEND_REVIEW", row.get("Task ID", ""), row.get("Created At", ""), row.get("Last Sent At", ""), mailbox_email]])
+                except Exception:
+                    logger.exception("Could not mark row SEND_REVIEW for %s", recipient)
+                write_run_log(run_log_ws, "WARNING", "SMTP_OUTCOME_UNCERTAIN", f"Recipient={recipient} | Mailbox={mailbox_email} | verify delivery before retrying")
                 return
             except Exception as exc:
                 last_exc = exc
-                logger.warning("Send failed via %s: %s", mailbox["email"], exc)
-                append_history(history_ws, recipient, website, mailbox["email"], "FAILED", details=f"Attempt {attempt_num}: {type(exc).__name__}", template_id=template_id)
-                if attempt_num < len(attempts_to_try):
+                logger.warning("SMTP send failed via %s: %s", mailbox_email, exc)
+                try:
+                    append_history(history_ws, recipient, website, mailbox_email, "FAILED", details=f"Attempt {attempt_num}: {type(exc).__name__}: {exc}", template_id=template_id)
+                except Exception:
+                    logger.exception("Could not write FAILED history for %s", mailbox_email)
+                    write_run_log(run_log_ws, "ERROR", "HISTORY_WRITE_FAILED", f"FAILED row not saved for {recipient} via {mailbox_email}")
+                if attempt_num < len(eligible_mailboxes):
                     time.sleep(2)
+                continue
 
-        sheets_retry(
-            websites_ws.update,
-            range_name=f"C{sheet_row}:G{sheet_row}",
-            values=[["FAILED", row.get("Task ID", ""), row.get("Created At", ""), row.get("Last Sent At", ""), last_mailbox_email]]
-        )
-        write_run_log(run_log_ws, "ERROR", "SEND_FAILED", f"{recipient}: {type(last_exc).__name__}: {last_exc}")
+            # SMTP accepted the message. From here onward, NEVER try another mailbox.
+            sent_successfully = True
+            try:
+                append_history(history_ws, recipient, website, mailbox_email, "SENT", message_id, "SMTP accepted", template_id=template_id)
+            except Exception as exc:
+                logger.exception("SMTP accepted email but SENT history write failed for %s", recipient)
+                write_run_log(run_log_ws, "ERROR", "SENT_HISTORY_WRITE_FAILED", f"Recipient={recipient} | Mailbox={mailbox_email} | Message-ID={message_id} | {type(exc).__name__}: {exc}")
+
+            try:
+                sheets_retry(
+                    websites_ws.update,
+                    range_name=f"C{sheet_row}:G{sheet_row}",
+                    values=[["SENT", row.get("Task ID", ""), row.get("Created At", ""), timestamp(), mailbox_email]]
+                )
+            except Exception as exc:
+                logger.exception("SMTP accepted email but Websites status update failed for %s", recipient)
+                write_run_log(run_log_ws, "ERROR", "SENT_STATUS_UPDATE_FAILED", f"Recipient={recipient} | Mailbox={mailbox_email} | Message-ID={message_id} | {type(exc).__name__}: {exc}")
+            contacted.add(recipient)
+            break
+
+        if sent_successfully:
+            return
+
+        # All SMTP attempts failed. Record the final outcome without masking the error.
+        try:
+            sheets_retry(
+                websites_ws.update,
+                range_name=f"C{sheet_row}:G{sheet_row}",
+                values=[["FAILED", row.get("Task ID", ""), row.get("Created At", ""), row.get("Last Sent At", ""), eligible_mailboxes[-1]["email"]]]
+            )
+        except Exception:
+            logger.exception("Could not update Websites row to FAILED for %s", recipient)
+        write_run_log(run_log_ws, "ERROR", "SEND_FAILED", f"{recipient}: {type(last_exc).__name__ if last_exc else 'UnknownError'}: {last_exc}")
         return
+
 
 
 # =========================================================
@@ -1435,6 +1585,7 @@ def update_dashboard(dashboard_ws, history_ws, websites_ws, mailboxes):
                 counts[status] += 1
     pending = sum(1 for row in websites if str(row.get("Status", "")).strip().upper() == "PENDING")
     name_unsure = sum(1 for row in websites if str(row.get("Status", "")).strip().upper() == "NAME_UNSURE")
+    send_review = sum(1 for row in websites if str(row.get("Status", "")).strip().upper() == "SEND_REVIEW")
 
     dashboard_data = [
         ["Metric", "Value"],
@@ -1445,10 +1596,11 @@ def update_dashboard(dashboard_ws, history_ws, websites_ws, mailboxes):
         ["Today's Failed", counts["FAILED"]],
         ["Currently Sending", counts["SENDING"]],
         ["Pending Websites", pending],
-        ["Name Unsure Review", name_unsure]
+        ["Name Unsure Review", name_unsure],
+        ["Send Review Required", send_review]
     ]
     sheets_retry(dashboard_ws.clear)
-    sheets_retry(dashboard_ws.update, range_name="A1:B9", values=dashboard_data)
+    sheets_retry(dashboard_ws.update, range_name=f"A1:B{len(dashboard_data)}", values=dashboard_data)
 
 
 # =========================================================
@@ -1463,6 +1615,7 @@ def main():
     websites_ws = get_worksheet(spreadsheet, "Websites")
     templates_ws = get_worksheet(spreadsheet, "Templates")
     history_ws = get_worksheet(spreadsheet, "History")
+    archive_ws = get_worksheet(spreadsheet, "Archive")
     replies_ws = get_worksheet(spreadsheet, "Replies")
     dashboard_ws = get_worksheet(spreadsheet, "Dashboard")
     suppression_ws = get_worksheet(spreadsheet, "Suppression")
@@ -1476,15 +1629,16 @@ def main():
     repair_stuck_sending_rows(websites_ws, history_ws, run_log_ws)
     archive_old_logs(spreadsheet, history_ws, run_log_ws, retention_days=30)
     discover_new_tasks(websites_ws, run_log_ws)
-    read_replies(mailboxes, replies_ws, suppression_ws, websites_ws, run_log_ws)
+    read_replies(mailboxes, replies_ws, suppression_ws, websites_ws, history_ws, archive_ws, run_log_ws)
 
     can_send = True
-    if not HAMZA_SIGNATURE:
+    if not HAMZA_SIGNATURE.strip():
         write_run_log(run_log_ws, "ERROR", "SIGNATURE_MISSING", "HAMZA_SIGNATURE is empty. Sending skipped.")
         can_send = False
-    if len(mailboxes) > 1 and not ARSLAN_SIGNATURE:
-        write_run_log(run_log_ws, "WARNING", "ARSLAN_SIGNATURE_MISSING", "2nd mailbox will use HAMZA_SIGNATURE.")
-    if len(mailboxes) > 2 and not JAMES_SIGNATURE:
+    if len(mailboxes) > 1 and not ARSLAN_SIGNATURE.strip():
+        write_run_log(run_log_ws, "ERROR", "SIGNATURE_MISSING", "ARSLAN_SIGNATURE is empty. Sending skipped.")
+        can_send = False
+    if len(mailboxes) > 2 and not JAMES_SIGNATURE.strip():
         write_run_log(run_log_ws, "ERROR", "SIGNATURE_MISSING", "JAMES_SIGNATURE is empty. Sending skipped for the third mailbox configuration.")
         can_send = False
     if len(mailboxes) > 3:
