@@ -55,10 +55,6 @@ jobs:
           # Remove this line to send at any hour.
           ENFORCE_SEND_WINDOW: ${{ secrets.ENFORCE_SEND_WINDOW }}
 
-          # Auto-reply (price / budget)
-          AUTO_REPLY_ENABLED: "1"
-          AUTO_REPLY_TEMPLATE_ID: BEST_PRICE
-          AUTO_REPLY_MAX_PER_RUN: "3"
 
           PYTHONUNBUFFERED: "1"
 
