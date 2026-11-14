@@ -5,25 +5,18 @@ import time
 import ssl
 import smtplib
 import imaplib
-import sys
 import hashlib
 import logging
 import html
 import requests
+import email
 
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email.message import EmailMessage
 from email.header import decode_header
-from email.utils import formataddr, make_msgid
+from email.utils import formataddr, make_msgid, parseaddr
 
-from replies import (
-    read_replies,
-    send_auto_replies,
-    backfill_auto_reply_flag,
-    classify_reply,
-    extract_body,
-)
 
 
 # =========================================================
@@ -76,15 +69,8 @@ SEND_END_HOUR = 16
 PAUSE_START_HOUR = 13
 PAUSE_END_HOUR = 14
 
-# Auto-reply (price / budget), sent once to a contact who replied.
-# The AI reads the vendor's reply and the matching template is taken from the
-# "Reply Templates" sheet (see replies.py).
-# AUTO_REPLY_TEMPLATE_ID is only used to keep an old "BEST_PRICE" row of the
-# Templates sheet out of cold outreach.
-# Set env AUTO_REPLY_ENABLED=0 to switch the feature off completely.
-AUTO_REPLY_ENABLED = os.getenv("AUTO_REPLY_ENABLED", "1").strip().lower() not in ("0", "false", "no")
-AUTO_REPLY_TEMPLATE_ID = os.getenv("AUTO_REPLY_TEMPLATE_ID", "BEST_PRICE").strip() or "BEST_PRICE"
-AUTO_REPLY_MAX_PER_RUN = int(os.getenv("AUTO_REPLY_MAX_PER_RUN", "3") or 3)
+# Keep the legacy BEST_PRICE reply template out of regular cold outreach.
+LEGACY_BEST_PRICE_TEMPLATE_ID = "BEST_PRICE"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,7 +96,7 @@ HEADERS = {
     "Websites": [
         "Website", "Email", "Status", "Task ID",
         "Created At", "Last Sent At", "Mailbox",
-        "Reply Status", "Notes", "Auto Reply"
+        "Reply Status", "Notes"
     ],
     "Templates": [
         "Template ID", "Subject", "Body", "Active"
@@ -123,9 +109,6 @@ HEADERS = {
     "Replies": [
         "Received At", "From", "Subject",
         "Message ID", "Classification", "Snippet"
-    ],
-    "Reply Templates": [
-        "Template ID", "Intent", "Subject", "Body", "Active"
     ],
     "Dashboard": [
         "Metric", "Value"
@@ -229,8 +212,6 @@ def setup_tabs(spreadsheet):
                 range_name=f"{column_letter(len(current) + 1)}1:{end_column}1",
                 values=[added]
             )
-            if name == "Websites":
-                backfill_auto_reply_flag(ws, sheets_retry)
             continue
 
         if current[:len(headers)] != headers:
@@ -690,6 +671,232 @@ def daily_sent_count(history_rows, mailbox_email):
     )
 
 
+
+
+# =========================================================
+# INCOMING REPLY DETECTION & TRACKING
+# =========================================================
+
+EMAIL_FINDER = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+AUTO_SUBJECT_TERMS = (
+    "out of office", "automatic reply", "auto-reply", "autoreply",
+    "auto reply", "away from my desk", "vacation reply",
+)
+NOREPLY_PREFIXES = ("noreply@", "no-reply@", "donotreply@", "do-not-reply@")
+
+# A stronger status never gets overwritten by a weaker one.
+_REPLY_STATUS_PRIORITY = {
+    "": 0,
+    "AUTOREPLY": 1,
+    "REPLY": 2,
+    "BOUNCE": 3,
+    "UNSUBSCRIBE": 3,
+}
+
+
+def is_auto_responder(message):
+    """True for out-of-office / automatic mails (RFC 3834 and common headers)."""
+    auto_submitted = str(message.get("Auto-Submitted", "")).strip().lower()
+    if auto_submitted and auto_submitted != "no":
+        return True
+    precedence = str(message.get("Precedence", "")).strip().lower()
+    if precedence in ("bulk", "junk", "auto_reply", "list"):
+        return True
+    if message.get("X-Autoreply") or message.get("X-Autorespond"):
+        return True
+    return False
+
+
+def _looks_automatic(subject, sender):
+    subject_l = (subject or "").lower()
+    if any(term in subject_l for term in AUTO_SUBJECT_TERMS):
+        return True
+    return (sender or "").lower().startswith(NOREPLY_PREFIXES)
+
+
+def classify_reply(subject, body, from_address="", auto_responder=False):
+    text = f"{subject} {body}".lower()
+    sender = (from_address or "").lower()
+    if sender.startswith(("mailer-daemon@", "postmaster@")):
+        return "BOUNCE"
+    if any(term in text for term in [
+        "mailbox not found", "user unknown", "address rejected",
+        "delivery failed", "undelivered mail", "delivery status notification"
+    ]):
+        return "BOUNCE"
+    if auto_responder or _looks_automatic(subject, sender):
+        return "AUTOREPLY"
+    if any(term in text for term in [
+        "unsubscribe", "remove me", "do not contact", "stop emailing", "opt out"
+    ]):
+        return "UNSUBSCRIBE"
+    return "REPLY"
+
+
+def extract_body(message):
+    parts = []
+    if message.is_multipart():
+        for part in message.walk():
+            if (
+                part.get_content_type() == "text/plain"
+                and part.get_content_disposition() != "attachment"
+            ):
+                payload = part.get_payload(decode=True)
+                if payload:
+                    parts.append(
+                        payload.decode(
+                            part.get_content_charset() or "utf-8",
+                            errors="replace"
+                        )
+                    )
+    else:
+        payload = message.get_payload(decode=True)
+        if payload:
+            parts.append(
+                payload.decode(
+                    message.get_content_charset() or "utf-8",
+                    errors="replace"
+                )
+            )
+    return "\n".join(parts).strip()
+
+
+def extract_bounced_recipients(message, body, known_recipients):
+    """Only accept bounce addresses that exist in the Websites sheet."""
+    candidates = set()
+    header = str(message.get("X-Failed-Recipients", ""))
+    for address in EMAIL_FINDER.findall(header):
+        candidates.add(normalize_email(address))
+    for address in EMAIL_FINDER.findall(body or ""):
+        candidates.add(normalize_email(address))
+    return {address for address in candidates if address in known_recipients}
+
+
+def read_replies(mailboxes, replies_ws, suppression_ws, websites_ws, run_log_ws):
+    """Read unseen incoming mail, classify it, and update reply/suppression status.
+
+    This function only detects and records incoming replies. It never sends email.
+    """
+    existing_ids = {
+        str(row.get("Message ID", "")).strip()
+        for row in get_rows(replies_ws)
+        if row.get("Message ID")
+    }
+
+    website_rows = get_rows(websites_ws)
+    rows_by_email = {}
+    status_by_row = {}
+    for idx, website_row in enumerate(website_rows, start=2):
+        address = normalize_email(website_row.get("Email", ""))
+        if address:
+            rows_by_email.setdefault(address, []).append(idx)
+        status_by_row[idx] = str(
+            website_row.get("Reply Status", "")
+        ).strip().upper()
+
+    known_recipients = set(rows_by_email)
+    suppressed_now = get_suppressed_emails(suppression_ws)
+
+    for mailbox in mailboxes:
+        if not mailbox.get("imap_host"):
+            continue
+
+        connection = None
+        try:
+            connection = imaplib.IMAP4_SSL(
+                mailbox["imap_host"],
+                int(mailbox.get("imap_port", 993)),
+                ssl_context=ssl.create_default_context()
+            )
+            connection.login(mailbox["email"], mailbox["password"])
+            connection.select("INBOX")
+            status, data = connection.search(None, "UNSEEN")
+            if status != "OK":
+                continue
+
+            for number in data[0].split():
+                status, message_data = connection.fetch(number, "(RFC822)")
+                if status != "OK":
+                    continue
+
+                message = email.message_from_bytes(message_data[0][1])
+                message_id = str(message.get("Message-ID", "")).strip()
+                if message_id and message_id in existing_ids:
+                    connection.store(number, "+FLAGS", "\\Seen")
+                    continue
+
+                from_address = normalize_email(
+                    parseaddr(message.get("From", ""))[1]
+                )
+                subject = decode_text(message.get("Subject", ""))
+                body = extract_body(message)
+                classification = classify_reply(
+                    subject, body, from_address, is_auto_responder(message)
+                )
+                snippet = body[:1200].replace("\n", " ")
+
+                sheets_retry(
+                    replies_ws.append_row,
+                    [
+                        timestamp(), from_address, subject,
+                        message_id, classification, snippet
+                    ]
+                )
+                if message_id:
+                    existing_ids.add(message_id)
+
+                if classification == "BOUNCE":
+                    targets = extract_bounced_recipients(
+                        message, body, known_recipients
+                    )
+                else:
+                    targets = {from_address} if from_address else set()
+
+                for target in targets:
+                    if (
+                        classification in ("UNSUBSCRIBE", "BOUNCE")
+                        and target not in suppressed_now
+                    ):
+                        add_to_suppression(
+                            suppression_ws, target, classification
+                        )
+                        suppressed_now.add(target)
+
+                    for sheet_row in rows_by_email.get(target, []):
+                        current = status_by_row.get(sheet_row, "")
+                        if (
+                            _REPLY_STATUS_PRIORITY.get(classification, 0)
+                            >= _REPLY_STATUS_PRIORITY.get(current, 0)
+                        ):
+                            sheets_retry(
+                                websites_ws.update_cell,
+                                sheet_row, 8, classification
+                            )
+                            status_by_row[sheet_row] = classification
+
+                connection.store(number, "+FLAGS", "\\Seen")
+
+        except Exception as exc:
+            logger.exception(
+                "Reading replies failed for %s", mailbox.get("email")
+            )
+            if run_log_ws:
+                write_run_log(
+                    run_log_ws,
+                    "ERROR",
+                    "IMAP_FAILED",
+                    f"{mailbox.get('email')}: {type(exc).__name__}: {exc}"
+                )
+        finally:
+            if connection is not None:
+                try:
+                    connection.logout()
+                except Exception:
+                    pass
+
+
+
 # =========================================================
 # REPAIR, TASK DISCOVERY & ARCHIVING
 # =========================================================
@@ -835,7 +1042,8 @@ def get_active_templates(templates_ws):
         template_id = str(row.get("Template ID", "")).strip()
         subject = str(row.get("Subject", "")).strip()
         body = str(row.get("Body", "")).strip()
-        if template_id.lower() == AUTO_REPLY_TEMPLATE_ID.lower():
+        # Keep the old BEST_PRICE reply template out of regular outreach.
+        if template_id.lower() == LEGACY_BEST_PRICE_TEMPLATE_ID.lower():
             continue
         if str(row.get("Active", "")).strip().lower() in ("true", "yes", "1", "active"):
             if template_id and subject and body:
@@ -1029,7 +1237,7 @@ def save_sent_copy_to_imap(mailbox, message):
                 pass
 
 
-def send_email(mailbox, recipient, subject, body, mailboxes, in_reply_to=None, references=None):
+def send_email(mailbox, recipient, subject, body, mailboxes):
     signature_html = get_signature_html(mailbox, mailboxes)
     clean_body = remove_body_signoff(body)
     signature_text = html_signature_to_text(signature_html)
@@ -1039,10 +1247,6 @@ def send_email(mailbox, recipient, subject, body, mailboxes, in_reply_to=None, r
     message["To"] = recipient
     message["Subject"] = subject
     message["Message-ID"] = make_msgid()
-    if in_reply_to:
-        message["In-Reply-To"] = in_reply_to
-    if references:
-        message["References"] = references
 
     plain_content = clean_body.rstrip()
     if signature_text:
@@ -1248,7 +1452,6 @@ def main():
     templates_ws = get_worksheet(spreadsheet, "Templates")
     history_ws = get_worksheet(spreadsheet, "History")
     replies_ws = get_worksheet(spreadsheet, "Replies")
-    reply_templates_ws = get_worksheet(spreadsheet, "Reply Templates")
     dashboard_ws = get_worksheet(spreadsheet, "Dashboard")
     suppression_ws = get_worksheet(spreadsheet, "Suppression")
     run_log_ws = get_worksheet(spreadsheet, "Run Log")
@@ -1261,13 +1464,7 @@ def main():
     repair_stuck_sending_rows(websites_ws, history_ws, run_log_ws)
     archive_old_logs(spreadsheet, history_ws, run_log_ws, retention_days=30)
     discover_new_tasks(websites_ws, run_log_ws)
-    core = sys.modules[__name__]  # replies.py uses main's helpers through this
-    read_replies(mailboxes, replies_ws, suppression_ws, websites_ws, run_log_ws, core)
-    try:
-        send_auto_replies(mailboxes, websites_ws, replies_ws, reply_templates_ws, history_ws, suppression_ws, run_log_ws, core)
-    except Exception as exc:
-        logger.exception("Auto-reply step failed.")
-        write_run_log(run_log_ws, "ERROR", "AUTO_REPLY_STEP_FAILED", repr(exc))
+    read_replies(mailboxes, replies_ws, suppression_ws, websites_ws, run_log_ws)
 
     can_send = True
     if not HAMZA_SIGNATURE:
