@@ -264,9 +264,20 @@ def pending_task_count(rows):
 
 
 def within_send_window():
+    # One switch controls BOTH the Eastern-time sending window and
+    # the Saturday/Sunday sending block. Set GitHub Secret
+    # ENFORCE_SEND_WINDOW to "1" to enforce both restrictions.
     if os.getenv("ENFORCE_SEND_WINDOW", "").strip().lower() not in ("1", "true", "yes"):
         return True
-    hour = now_local().hour
+
+    current = now_local()
+
+    # Monday=0 ... Saturday=5, Sunday=6.
+    # No new outreach emails are sent on weekends in America/New_York.
+    if current.weekday() >= 5:
+        return False
+
+    hour = current.hour
     if hour < SEND_START_HOUR or hour >= SEND_END_HOUR:
         return False
     if PAUSE_START_HOUR <= hour < PAUSE_END_HOUR:
@@ -1646,7 +1657,9 @@ def main():
         can_send = False
 
     if can_send and not within_send_window():
-        write_run_log(run_log_ws, "INFO", "OUTSIDE_SEND_WINDOW", f"Eastern hour={now_local().hour}. Sending skipped.")
+        current_eastern = now_local()
+        reason = "weekend" if current_eastern.weekday() >= 5 else f"Eastern hour={current_eastern.hour}"
+        write_run_log(run_log_ws, "INFO", "OUTSIDE_SEND_WINDOW", f"Sending skipped: {reason} (America/New_York).")
         can_send = False
 
     if can_send:
